@@ -1,0 +1,114 @@
+====================================================================================================
+                    OPTIONS MODEL COMPARISON REPORT
+====================================================================================================
+                    COIN 0DTE MOMENTUM STRATEGY - NOVEMBER 2024
+====================================================================================================
+
+MODELS COMPARED:
+  v1: Simple Model (Black-Scholes with flat 80% IV)
+  v2: Advanced Model (IV smile/skew, intraday patterns, 0DTE decay, realistic spreads)
+
+====================================================================================================
+                              PERFORMANCE SUMMARY
+====================================================================================================
+
+METRIC                          V1 SIMPLE MODEL       V2 ADVANCED MODEL     DIFFERENCE
+----------------------------------------------------------------------------------------------------
+Total Return                    +4.82%                +13.97%               +9.15% better
+Total P&L                       $4,819.65             $13,974.67            +$9,155.02
+Final Equity                    $104,819.65           $113,974.67           +$9,155.02
+----------------------------------------------------------------------------------------------------
+Total Trades                    19                    22                    +3 trades
+Win Rate                        89.5% (17/19)         86.4% (19/22)         -3.1%
+Profit Factor                   4.84                  10.37                 +5.53
+----------------------------------------------------------------------------------------------------
+Gross Profit                    $6,134.72             $15,608.45            +$9,473.73
+Gross Loss                      $1,266.32             $1,505.08             +$238.76
+Average Win                     $360.87 (+18.49%)     $821.50 (+47.15%)     +$460.63
+Average Loss                    $-633.16 (-42.35%)    $-501.69 (-32.63%)    Smaller losses
+----------------------------------------------------------------------------------------------------
+Largest Win                     $1,280.57             $4,964.44             +$3,683.87
+Largest Loss                    $-863.42              $-718.31              -$145.11
+----------------------------------------------------------------------------------------------------
+Max Drawdown                    3.58% ($3,667.29)     1.92% ($2,162.54)     -1.66% better
+Calmar Ratio                    1.35                  7.27                  +5.92
+----------------------------------------------------------------------------------------------------
+Avg Hold Time                   2.8 minutes           3.5 minutes           +0.7 minutes
+----------------------------------------------------------------------------------------------------
+Return on Capital Deployed      14.85%                42.18%                +27.33%
+====================================================================================================
+
+                              KEY OBSERVATIONS
+====================================================================================================
+
+1. SIGNIFICANTLY HIGHER RETURNS
+   The advanced model produced nearly 3x the returns ($13,974 vs $4,819).
+   This is likely due to more realistic options pricing capturing larger
+   intraday price swings.
+
+2. BETTER RISK-ADJUSTED PERFORMANCE
+   - Profit Factor improved from 4.84 to 10.37 (2x better)
+   - Max Drawdown reduced from 3.58% to 1.92% (46% improvement)
+   - Calmar Ratio improved from 1.35 to 7.27 (5x better)
+
+3. OPTIONS PRICING DIFFERENCES
+   The advanced model uses:
+   - IV Smile/Skew: OTM puts have ~15% higher IV than ATM
+   - Intraday IV Patterns: +8% IV at open/close, -0% midday
+   - 0DTE Premium: +15% IV boost for same-day expiry options
+   - These features make cheap options (like $0.32 calls) more volatile
+
+4. NOTABLE TRADES (Advanced Model)
+   - Trade #6 (Nov 8): +169.57% on $0.32 calls -> $2,933.17 profit
+   - Trade #12 (Nov 15): +289.18% on $0.35 puts -> $4,964.44 profit
+   These massive wins came from cheap near-expiry options that saw
+   huge IV expansion under the advanced model.
+
+5. WHY RESULTS DIFFER
+   The simple model used flat 80% IV for all options. The advanced model
+   uses dynamic IV (85% base for COIN with smile/skew adjustments), which:
+   - Makes cheap OTM options more expensive (higher IV = higher premiums)
+   - Creates more volatility in options near expiry
+   - More accurately simulates real market conditions
+
+====================================================================================================
+                              MODEL FEATURES COMPARISON
+====================================================================================================
+
+FEATURE                         V1 SIMPLE             V2 ADVANCED
+----------------------------------------------------------------------------------------------------
+Base IV                         80% (flat)            85% (COIN-specific)
+IV Smile                        No                    Yes (8% for far OTM)
+IV Skew                         No                    Yes (15% for OTM puts)
+Intraday IV Pattern             No                    Yes (higher at open/close)
+0DTE IV Premium                 No                    Yes (+15% for same-day)
+Bid-Ask Spread Model            No                    Yes (wider for OTM/0DTE)
+Greeks-based OHLC               No                    Yes (delta-adjusted)
+Price Noise/Jitter              No                    Yes (realistic fills)
+====================================================================================================
+
+                              CONCLUSION
+====================================================================================================
+
+The advanced options pricing model produces significantly better backtest results,
+but these results should be interpreted cautiously:
+
+PROS:
+- More realistic representation of options behavior
+- Captures IV dynamics that occur in real markets
+- Better models the premium for 0DTE options
+
+CONS:
+- Results may be OVERLY optimistic because:
+  - Real bid-ask spreads can be wider
+  - Real slippage can be higher
+  - Model assumes you can always fill at mid
+  - Synthetic options don't have real liquidity constraints
+
+RECOMMENDATION:
+Use the advanced model for backtesting, but apply a conservative discount
+(20-30%) to expected returns when planning live trading.
+
+====================================================================================================
+                              END OF COMPARISON REPORT
+====================================================================================================
