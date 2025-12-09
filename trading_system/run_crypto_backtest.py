@@ -517,12 +517,21 @@ class SimpleCryptoBacktestEngine:
     - Full analytics integration
     """
 
-    def __init__(self, initial_capital: float = 100000, commission_pct: float = 0.001):
+    def __init__(self, initial_capital: float = 100000, spread_pct: float = 0.0025):
+        """
+        Initialize backtest engine.
+
+        Args:
+            initial_capital: Starting capital
+            spread_pct: Bid-ask spread as percentage (Alpaca crypto taker fee is 0.25%)
+                        Applied as half on entry (buy at ask) and half on exit (sell at bid)
+        """
         self.initial_capital = initial_capital
-        self.commission_pct = commission_pct
+        self.spread_pct = spread_pct  # 0.25% for Alpaca crypto taker orders
+        self.half_spread = spread_pct / 2  # Half spread applied on each side
 
         self.capital = initial_capital
-        self.positions = {}  # symbol -> {qty, entry_price, entry_time}
+        self.positions = {}  # symbol -> {qty, entry_price, entry_cost, entry_time}
         self.trades = []
         self.equity_curve = []
         self.start_date = None
@@ -594,20 +603,24 @@ class SimpleCryptoBacktestEngine:
                 )
 
                 if should_exit:
-                    # Execute exit
-                    proceeds = pos['qty'] * bar.close * (1 - self.commission_pct)
-                    pnl = proceeds - (pos['qty'] * pos['entry_price'])
+                    # Execute exit - sell at bid (mid - half spread)
+                    exit_price = bar.close * (1 - self.half_spread)
+                    proceeds = pos['qty'] * exit_price
+
+                    # P&L = proceeds from exit - total cost of entry
+                    pnl = proceeds - pos['entry_cost']
 
                     self.capital += proceeds
                     self.trades.append({
                         'symbol': symbol,
                         'entry_time': pos['entry_time'],
                         'exit_time': bar.timestamp,
-                        'entry_price': pos['entry_price'],
-                        'exit_price': bar.close,
+                        'entry_price': pos['entry_price'],  # Original mid price
+                        'exit_price': bar.close,  # Original mid price (for reference)
                         'qty': pos['qty'],
                         'pnl': pnl,
-                        'pnl_pct': (bar.close - pos['entry_price']) / pos['entry_price'] * 100,
+                        'pnl_pct': pnl / pos['entry_cost'] * 100,  # Correct % based on cost
+                        'spread_cost': pos['entry_cost'] - (pos['qty'] * pos['entry_price']) + (pos['qty'] * bar.close - proceeds),
                         'exit_reason': exit_reason,
                     })
 
@@ -623,15 +636,17 @@ class SimpleCryptoBacktestEngine:
 
                 # Process entry signal (only if no position exists)
                 if state.pending_entry_order_id and symbol not in self.positions:
-                    # Execute entry
-                    qty = strategy.config.fixed_position_value / bar.close
-                    cost = qty * bar.close * (1 + self.commission_pct)
+                    # Execute entry - buy at ask (mid + half spread)
+                    fill_price = bar.close * (1 + self.half_spread)
+                    qty = strategy.config.fixed_position_value / fill_price
+                    entry_cost = qty * fill_price  # Total cost including spread
 
-                    if cost <= self.capital:
-                        self.capital -= cost
+                    if entry_cost <= self.capital:
+                        self.capital -= entry_cost
                         self.positions[symbol] = {
                             'qty': qty,
-                            'entry_price': bar.close,
+                            'entry_price': bar.close,  # Store mid price for reference
+                            'entry_cost': entry_cost,  # Store actual cost for P&L calc
                             'entry_time': bar.timestamp,
                         }
                         state.entry_price = bar.close
@@ -657,8 +672,10 @@ class SimpleCryptoBacktestEngine:
         # Close remaining positions
         for symbol, pos in list(self.positions.items()):
             last_bar = [b for b in all_bars if b.symbol == symbol][-1]
-            proceeds = pos['qty'] * last_bar.close * (1 - self.commission_pct)
-            pnl = proceeds - (pos['qty'] * pos['entry_price'])
+            # Sell at bid (mid - half spread)
+            exit_price = last_bar.close * (1 - self.half_spread)
+            proceeds = pos['qty'] * exit_price
+            pnl = proceeds - pos['entry_cost']
 
             self.capital += proceeds
             self.trades.append({
@@ -669,7 +686,8 @@ class SimpleCryptoBacktestEngine:
                 'exit_price': last_bar.close,
                 'qty': pos['qty'],
                 'pnl': pnl,
-                'pnl_pct': (last_bar.close - pos['entry_price']) / pos['entry_price'] * 100,
+                'pnl_pct': pnl / pos['entry_cost'] * 100,
+                'spread_cost': pos['entry_cost'] - (pos['qty'] * pos['entry_price']) + (pos['qty'] * last_bar.close - proceeds),
                 'exit_reason': 'End of backtest',
             })
 
@@ -883,6 +901,11 @@ def print_report(results: CryptoBacktestResults, symbols: list, data_sources: di
         print(f"  Best Trade:        ${df['pnl'].max():,.2f}")
         print(f"  Worst Trade:       ${df['pnl'].min():,.2f}")
 
+        # Show spread cost if available
+        if 'spread_cost' in df.columns:
+            total_spread_cost = df['spread_cost'].sum()
+            print(f"  Total Spread Cost: ${total_spread_cost:,.2f} (Alpaca 0.25% taker fee)")
+
         print(f"\n{'P&L BY SYMBOL':=^100}")
         for symbol, pnl in df.groupby('symbol')['pnl'].sum().items():
             print(f"  {symbol:<15} ${pnl:>15,.2f}")
@@ -895,6 +918,20 @@ def print_report(results: CryptoBacktestResults, symbols: list, data_sources: di
     print(f"  Max Drawdown:      ${results.max_drawdown:,.2f} ({results.max_drawdown_pct:.2f}%)")
     print(f"  Sharpe Ratio:      {results.sharpe_ratio:.2f}")
     print(f"  Sortino Ratio:     {results.sortino_ratio:.2f}")
+
+    # P&L Validation Check
+    print(f"\n{'P&L VALIDATION':=^100}")
+    equity_change = results.final_equity - results.initial_capital
+    pnl_diff = abs(results.total_pnl - equity_change)
+    if pnl_diff < 0.01:  # Allow $0.01 rounding error
+        print(f"  [OK] P&L matches equity change")
+        print(f"       Sum of Trade P&L: ${results.total_pnl:,.2f}")
+        print(f"       Equity Change:    ${equity_change:,.2f}")
+    else:
+        print(f"  [WARNING] P&L mismatch detected!")
+        print(f"       Sum of Trade P&L: ${results.total_pnl:,.2f}")
+        print(f"       Equity Change:    ${equity_change:,.2f}")
+        print(f"       Difference:       ${pnl_diff:,.2f}")
 
     print("\n" + "=" * 100)
 
@@ -950,9 +987,10 @@ async def run_backtest(args):
     strategy = CryptoScalping(config)
 
     # Create and run backtest engine
+    # Alpaca Crypto uses 0.25% taker fee (applied as spread)
     engine = SimpleCryptoBacktestEngine(
         initial_capital=args.capital,
-        commission_pct=0.001  # 0.1% commission
+        spread_pct=0.0025  # 0.25% Alpaca crypto taker fee
     )
 
     results = engine.run(strategy, data)

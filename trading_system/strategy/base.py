@@ -323,8 +323,7 @@ class Strategy(ABC):
         """
         if self._engine:
             self._engine.order_manager.submit_order(order)
-        else:
-            self.log.error("Cannot submit order: No engine connected")
+        # else: No internal engine - order handled externally (e.g., crypto_paper_trading_engine)
 
     def cancel_order(self, order_id) -> bool:
         """

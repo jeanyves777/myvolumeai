@@ -1,21 +1,44 @@
 """
 Ensemble prediction system with weighted voting.
 """
+print(">>> [ensemble.py] Module loading...", flush=True)
 
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 import logging
+import time
 
+print(">>> [ensemble.py] Importing base...", flush=True)
 from .base import BaseMLModel
-from .models import (
-    RandomForestModel,
-    XGBoostModel,
-    LSTMModel,
-    LogisticModel,
-    SVMModel
-)
 
+# LAZY model imports - sklearn/xgboost are slow to load
+print(">>> [ensemble.py] Setting up lazy model imports...", flush=True)
+_models_loaded = False
+RandomForestModel = None
+XGBoostModel = None
+LogisticModel = None
+SVMModel = None
+
+def _load_models():
+    """Lazy load ML models to avoid slow sklearn/xgboost import at module load."""
+    global _models_loaded, RandomForestModel, XGBoostModel, LogisticModel, SVMModel
+    if not _models_loaded:
+        print(">>> [ensemble.py] Loading ML models (sklearn, xgboost)...", flush=True)
+        from .models import RandomForestModel as RF, XGBoostModel as XGB, LogisticModel as LR, SVMModel as SVM
+        RandomForestModel = RF
+        XGBoostModel = XGB
+        LogisticModel = LR
+        SVMModel = SVM
+        _models_loaded = True
+        print(">>> [ensemble.py] ML models loaded OK", flush=True)
+
+def get_lstm_model():
+    """Lazy load LSTM model."""
+    from .models import get_lstm_model as _get_lstm
+    return _get_lstm()
+
+print(">>> [ensemble.py] Module loaded (models deferred)", flush=True)
 logger = logging.getLogger(__name__)
 
 
@@ -50,36 +73,53 @@ class EnsemblePredictor:
         
     def _create_default_models(self) -> List[BaseMLModel]:
         """Create default ensemble models, skipping those that can't be loaded."""
+        print(">>> [ensemble._create_default_models] Loading models...", flush=True)
+
+        # Load models lazily
+        _load_models()
+
         models = []
 
         # Try to create each model, skip if dependency missing
+        print(">>> [ensemble] Creating RandomForest...", flush=True)
         try:
             models.append(RandomForestModel())  # 20%
             logger.info("  ✅ RandomForest loaded")
+            print(">>> [ensemble] RandomForest OK", flush=True)
         except ImportError as e:
             logger.warning(f"  ⚠️ RandomForest skipped: {e}")
 
+        print(">>> [ensemble] Creating XGBoost...", flush=True)
         try:
             models.append(XGBoostModel())       # 25%
             logger.info("  ✅ XGBoost loaded")
+            print(">>> [ensemble] XGBoost OK", flush=True)
         except ImportError as e:
             logger.warning(f"  ⚠️ XGBoost skipped: {e}")
 
+        print(">>> [ensemble] Creating LSTM (may be slow)...", flush=True)
         try:
+            LSTMModel = get_lstm_model()
             models.append(LSTMModel())          # 20%
             logger.info("  ✅ LSTM loaded")
+            print(">>> [ensemble] LSTM OK", flush=True)
         except ImportError as e:
             logger.warning(f"  ⚠️ LSTM skipped (TensorFlow not installed): {e}")
+            print(f">>> [ensemble] LSTM skipped: {e}", flush=True)
 
+        print(">>> [ensemble] Creating Logistic...", flush=True)
         try:
             models.append(LogisticModel())      # 15%
             logger.info("  ✅ Logistic loaded")
+            print(">>> [ensemble] Logistic OK", flush=True)
         except ImportError as e:
             logger.warning(f"  ⚠️ Logistic skipped: {e}")
 
+        print(">>> [ensemble] Creating SVM...", flush=True)
         try:
             models.append(SVMModel())            # 20%
             logger.info("  ✅ SVM loaded")
+            print(">>> [ensemble] SVM OK", flush=True)
         except ImportError as e:
             logger.warning(f"  ⚠️ SVM skipped: {e}")
 
@@ -102,44 +142,101 @@ class EnsemblePredictor:
               y_val: Optional[pd.Series] = None) -> Dict[str, Dict[str, float]]:
         """
         Train all models in the ensemble.
-        
+
         Args:
             X_train: Training features
             y_train: Training labels
             X_val: Validation features (optional)
             y_val: Validation labels (optional)
-            
+
         Returns:
             Dictionary of training metrics for each model
         """
         all_metrics = {}
-        
-        logger.info(f"Training ensemble with {len(self.models)} models...")
-        
+        model_times = []
+        total_models = len(self.models)
+
+        # Estimate training times based on model type and data size
+        n_samples = len(X_train)
+        n_features = X_train.shape[1]
+
+        # Time estimates per model (rough, in seconds per 10k samples)
+        time_estimates = {
+            'random_forest': 30,  # RF is slow, many trees
+            'xgboost': 20,        # XGB is optimized
+            'logistic': 5,        # LR is fast
+            'svm': 60,            # SVM is slow on large data
+            'lstm': 120           # LSTM needs epochs
+        }
+
+        print(f">>> [ensemble.train] +=========================================================+", flush=True)
+        print(f">>> [ensemble.train] |  ENSEMBLE MODEL TRAINING                                  |", flush=True)
+        print(f">>> [ensemble.train] +---------------------------------------------------------+", flush=True)
+        print(f">>> [ensemble.train] |  Models:     {total_models:>10}                              |", flush=True)
+        print(f">>> [ensemble.train] |  Samples:    {n_samples:>10,}                              |", flush=True)
+        print(f">>> [ensemble.train] |  Features:   {n_features:>10}                              |", flush=True)
+        print(f">>> [ensemble.train] +=========================================================+", flush=True)
+
+        logger.info(f"Training ensemble with {total_models} models on {n_samples:,} samples...")
+
+        total_start = time.time()
+
         for i, model in enumerate(self.models):
             model_name = model.config.model_name
-            logger.info(f"Training model {i+1}/{len(self.models)}: {model_name}")
-            
+
+            # Estimate time for this model
+            base_estimate = time_estimates.get(model_name, 30)
+            est_seconds = max(5, (n_samples / 10000) * base_estimate)
+            est_minutes = est_seconds / 60
+
+            print(f">>> [ensemble.train] +---------------------------------------------------------+", flush=True)
+            print(f">>> [ensemble.train] |  Model {i+1}/{total_models}: {model_name.upper():20s}                |", flush=True)
+            print(f">>> [ensemble.train] |  Est. time: {est_minutes:.1f} min                                   |", flush=True)
+            print(f">>> [ensemble.train] +---------------------------------------------------------+", flush=True)
+            logger.info(f"Training model {i+1}/{total_models}: {model_name} (est. {est_minutes:.1f} min)")
+
+            model_start = time.time()
+
             try:
                 metrics = model.train(X_train, y_train, X_val, y_val)
                 all_metrics[model_name] = metrics
-                
+
+                elapsed = time.time() - model_start
+                model_times.append(elapsed)
+
                 # Log validation accuracy if available
                 if 'val_accuracy' in metrics:
-                    logger.info(f"{model_name} validation accuracy: {metrics['val_accuracy']:.4f}")
-                
+                    print(f">>> [ensemble.train] [OK] {model_name} done in {elapsed:.1f}s | val_acc: {metrics['val_accuracy']:.4f}", flush=True)
+                    logger.info(f"✅ {model_name} done in {elapsed:.1f}s | val_accuracy: {metrics['val_accuracy']:.4f}")
+                else:
+                    print(f">>> [ensemble.train] [OK] {model_name} done in {elapsed:.1f}s", flush=True)
+
+                # Show progress
+                completed = i + 1
+                remaining = total_models - completed
+                if model_times:
+                    avg_time = sum(model_times) / len(model_times)
+                    eta_seconds = remaining * avg_time
+                    print(f">>> [ensemble.train] Progress: {completed}/{total_models} | ETA: {eta_seconds/60:.1f} min remaining", flush=True)
+
             except Exception as e:
-                logger.error(f"Failed to train {model_name}: {str(e)}")
+                elapsed = time.time() - model_start
+                print(f">>> [ensemble.train] [FAIL] {model_name} FAILED after {elapsed:.1f}s: {e}", flush=True)
+                logger.error(f"Failed to train {model_name} after {elapsed:.1f}s: {str(e)}")
                 # Continue training other models
                 all_metrics[model_name] = {'error': str(e)}
-        
+
+        total_elapsed = time.time() - total_start
         self.is_trained = all(model.is_trained for model in self.models)
-        
+
+        print(f">>> [ensemble.train] ==========================================================", flush=True)
         if self.is_trained:
-            logger.info("✅ All models trained successfully")
+            print(f">>> [ensemble.train] [SUCCESS] ALL MODELS TRAINED in {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)", flush=True)
+            logger.info(f"✅ All models trained successfully in {total_elapsed:.1f}s")
         else:
-            logger.warning("⚠️ Some models failed to train")
-        
+            print(f">>> [ensemble.train] [WARN] SOME MODELS FAILED - Total time: {total_elapsed:.1f}s", flush=True)
+            logger.warning(f"⚠️ Some models failed to train (total time: {total_elapsed:.1f}s)")
+
         return all_metrics
     
     def predict(self, X: pd.DataFrame) -> np.ndarray:

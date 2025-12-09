@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from typing import Tuple, Optional, List
 import logging
+import time
 from pathlib import Path
 
 from ..features import FeatureEngineering
@@ -209,47 +210,82 @@ class DataPipeline:
     def handle_class_imbalance(self, X_train: pd.DataFrame, y_train: pd.Series,
                                method: str = 'smote') -> Tuple[pd.DataFrame, pd.Series]:
         """
-        Handle class imbalance using SMOTE or other methods.
-        
+        Handle class imbalance using simple oversampling (no external deps).
+
         Args:
             X_train: Training features
             y_train: Training labels
-            method: Method to use ('smote', 'random_oversample', 'none')
-            
+            method: Method to use ('smote', 'random_oversample', 'none', 'simple')
+
         Returns:
             Tuple of (resampled features, resampled labels)
         """
         if method == 'none':
             return X_train, y_train
-        
-        try:
-            from imblearn.over_sampling import SMOTE, RandomOverSampler
-            
-            if method == 'smote':
-                resampler = SMOTE(random_state=42)
-                logger.info("Applying SMOTE for class balancing...")
-            elif method == 'random_oversample':
-                resampler = RandomOverSampler(random_state=42)
-                logger.info("Applying random oversampling for class balancing...")
-            else:
-                logger.warning(f"Unknown method {method}, skipping resampling")
-                return X_train, y_train
-            
-            X_resampled, y_resampled = resampler.fit_resample(X_train, y_train)
-            
-            logger.info(f"Resampled from {len(X_train)} to {len(X_resampled)} samples")
-            logger.info(f"New class distribution: {pd.Series(y_resampled).value_counts().to_dict()}")
-            
-            # Convert back to DataFrame/Series
-            X_resampled = pd.DataFrame(X_resampled, columns=X_train.columns)
-            y_resampled = pd.Series(y_resampled, name=y_train.name)
-            
-            return X_resampled, y_resampled
-            
-        except ImportError:
-            logger.warning("imbalanced-learn not installed. Skipping class balancing.")
-            logger.warning("Install with: pip install imbalanced-learn")
+
+        # Use simple numpy-based oversampling to avoid slow imblearn import
+        start_time = time.time()
+        n_samples = len(X_train)
+
+        print(f">>> [data_pipeline] +=========================================================+", flush=True)
+        print(f">>> [data_pipeline] |  SIMPLE RANDOM OVERSAMPLING (no imblearn needed)        |", flush=True)
+        print(f">>> [data_pipeline] +---------------------------------------------------------+", flush=True)
+        print(f">>> [data_pipeline] |  Samples:    {n_samples:>10,}                              |", flush=True)
+        print(f">>> [data_pipeline] |  Est. time:  <1 second                                    |", flush=True)
+        print(f">>> [data_pipeline] +=========================================================+", flush=True)
+
+        logger.info("Applying simple random oversampling for class balancing...")
+
+        # Count classes
+        y_array = y_train.values if hasattr(y_train, 'values') else np.array(y_train)
+        unique, counts = np.unique(y_array, return_counts=True)
+
+        if len(unique) < 2:
+            logger.warning("Only one class found, skipping resampling")
             return X_train, y_train
+
+        max_count = counts.max()
+
+        # Find indices for each class
+        X_resampled_list = []
+        y_resampled_list = []
+
+        for cls, count in zip(unique, counts):
+            cls_mask = y_array == cls
+            X_cls = X_train[cls_mask]
+            y_cls = y_train[cls_mask]
+
+            if count < max_count:
+                # Oversample minority class
+                n_oversample = max_count - count
+                indices = np.random.choice(len(X_cls), size=n_oversample, replace=True)
+                X_oversampled = X_cls.iloc[indices]
+                y_oversampled = y_cls.iloc[indices]
+
+                X_resampled_list.append(X_cls)
+                X_resampled_list.append(X_oversampled)
+                y_resampled_list.append(y_cls)
+                y_resampled_list.append(y_oversampled)
+            else:
+                X_resampled_list.append(X_cls)
+                y_resampled_list.append(y_cls)
+
+        # Combine all
+        X_resampled = pd.concat(X_resampled_list, ignore_index=True)
+        y_resampled = pd.concat(y_resampled_list, ignore_index=True)
+
+        # Shuffle
+        shuffle_idx = np.random.permutation(len(X_resampled))
+        X_resampled = X_resampled.iloc[shuffle_idx].reset_index(drop=True)
+        y_resampled = y_resampled.iloc[shuffle_idx].reset_index(drop=True)
+
+        elapsed = time.time() - start_time
+        print(f">>> [data_pipeline] [OK] Resampling complete in {elapsed:.1f}s", flush=True)
+
+        logger.info(f"Resampled from {len(X_train)} to {len(X_resampled)} samples")
+        logger.info(f"New class distribution: {y_resampled.value_counts().to_dict()}")
+
+        return X_resampled, y_resampled
     
     def save_processed_data(self, features: pd.DataFrame, labels: pd.Series,
                            output_path: str):

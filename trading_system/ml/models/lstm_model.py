@@ -6,13 +6,25 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional
 
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers
-    TENSORFLOW_AVAILABLE = True
-except ImportError:
-    TENSORFLOW_AVAILABLE = False
+# Lazy import - TensorFlow is heavy and slow to load
+TENSORFLOW_AVAILABLE = None
+tf = None
+keras = None
+layers = None
+
+def _check_tensorflow():
+    """Lazy check for TensorFlow availability."""
+    global TENSORFLOW_AVAILABLE, tf, keras, layers
+    if TENSORFLOW_AVAILABLE is None:
+        try:
+            import tensorflow as _tf
+            tf = _tf
+            keras = tf.keras
+            layers = tf.keras.layers
+            TENSORFLOW_AVAILABLE = True
+        except ImportError:
+            TENSORFLOW_AVAILABLE = False
+    return TENSORFLOW_AVAILABLE
 
 from sklearn.preprocessing import StandardScaler
 
@@ -22,16 +34,16 @@ from ..base import BaseMLModel, MLModelConfig
 class LSTMModel(BaseMLModel):
     """
     LSTM Neural Network model.
-    
+
     Strengths:
     - Learns temporal patterns and sequences
     - Captures time-series dependencies
     - Good for momentum and trend detection
     """
-    
+
     def __init__(self, config: Optional[MLModelConfig] = None):
         """Initialize LSTM model."""
-        if not TENSORFLOW_AVAILABLE:
+        if not _check_tensorflow():
             raise ImportError("TensorFlow not installed. Install with: pip install tensorflow")
         
         if config is None:

@@ -23,6 +23,11 @@ from .crypto_trading_config import (
     run_crypto_reconfigure,
 )
 
+from .crypto_paper_trading_config import (
+    CryptoPaperTradingConfig,
+    DEFAULT_CRYPTO_SYMBOLS,
+)
+
 __all__ = [
     # Paper trading
     'PaperTradingConfig',
@@ -39,4 +44,7 @@ __all__ = [
     'ALPACA_CRYPTO_SYMBOLS',
     'run_crypto_setup_wizard',
     'run_crypto_reconfigure',
+    # Crypto paper trading
+    'CryptoPaperTradingConfig',
+    'DEFAULT_CRYPTO_SYMBOLS',
 ]

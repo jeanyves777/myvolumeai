@@ -5,10 +5,25 @@ Random Forest Model for ensemble.
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
 
 from ..base import BaseMLModel, MLModelConfig
+
+# Lazy sklearn imports
+_sklearn_loaded = False
+RandomForestClassifier = None
+StandardScaler = None
+
+def _load_sklearn():
+    """Lazy load sklearn to avoid slow import at module load."""
+    global _sklearn_loaded, RandomForestClassifier, StandardScaler
+    if not _sklearn_loaded:
+        print(">>> [random_forest_model] Loading sklearn...", flush=True)
+        from sklearn.ensemble import RandomForestClassifier as RFC
+        from sklearn.preprocessing import StandardScaler as SS
+        RandomForestClassifier = RFC
+        StandardScaler = SS
+        _sklearn_loaded = True
+        print(">>> [random_forest_model] sklearn loaded OK", flush=True)
 
 
 class RandomForestModel(BaseMLModel):
@@ -47,10 +62,13 @@ class RandomForestModel(BaseMLModel):
               X_val: Optional[pd.DataFrame] = None,
               y_val: Optional[pd.Series] = None) -> Dict[str, float]:
         """Train the Random Forest model."""
-        
+
+        # Lazy load sklearn
+        _load_sklearn()
+
         # Store feature columns
         self.feature_columns = X_train.columns.tolist()
-        
+
         # Random Forest doesn't need scaling, but we'll do it for consistency
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)

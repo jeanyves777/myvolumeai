@@ -6,15 +6,30 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional
 
-try:
-    import xgboost as xgb
-    XGBOOST_AVAILABLE = True
-except ImportError:
-    XGBOOST_AVAILABLE = False
-
-from sklearn.preprocessing import StandardScaler
-
 from ..base import BaseMLModel, MLModelConfig
+
+# Lazy imports
+_libs_loaded = False
+xgb = None
+StandardScaler = None
+XGBOOST_AVAILABLE = None
+
+def _load_libs():
+    """Lazy load xgboost and sklearn to avoid slow import at module load."""
+    global _libs_loaded, xgb, StandardScaler, XGBOOST_AVAILABLE
+    if not _libs_loaded:
+        print(">>> [xgboost_model] Loading xgboost and sklearn...", flush=True)
+        try:
+            import xgboost as _xgb
+            xgb = _xgb
+            XGBOOST_AVAILABLE = True
+        except ImportError:
+            XGBOOST_AVAILABLE = False
+
+        from sklearn.preprocessing import StandardScaler as SS
+        StandardScaler = SS
+        _libs_loaded = True
+        print(">>> [xgboost_model] Libraries loaded OK", flush=True)
 
 
 class XGBoostModel(BaseMLModel):
@@ -30,6 +45,8 @@ class XGBoostModel(BaseMLModel):
     
     def __init__(self, config: Optional[MLModelConfig] = None):
         """Initialize XGBoost model."""
+        # Check availability lazily
+        _load_libs()
         if not XGBOOST_AVAILABLE:
             raise ImportError("XGBoost not installed. Install with: pip install xgboost")
         

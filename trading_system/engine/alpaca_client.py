@@ -18,6 +18,8 @@ try:
     from alpaca.trading.requests import (
         MarketOrderRequest,
         LimitOrderRequest,
+        StopOrderRequest,
+        StopLimitOrderRequest,
         StopLossRequest,
         TakeProfitRequest,
         GetOrdersRequest,
@@ -36,10 +38,12 @@ try:
         OptionBarsRequest,
         StockLatestQuoteRequest,
         OptionLatestQuoteRequest,
+        OptionSnapshotRequest,
         CryptoBarsRequest,
         CryptoLatestQuoteRequest,
     )
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import OptionsFeed
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
@@ -69,6 +73,17 @@ class Bar:
     close: float
     volume: int
     timestamp: datetime
+
+
+@dataclass
+class OptionGreeks:
+    """Represents option Greeks from Alpaca snapshot."""
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
+    rho: float = 0.0
+    implied_volatility: float = 0.0
 
 
 class AlpacaClient:
@@ -266,6 +281,50 @@ class AlpacaClient:
         orders = self.trading_client.get_orders(request)
         return [self._order_to_dict(o) for o in orders]
 
+    def get_open_orders(self, underlying_symbol: str = None) -> List[Dict[str, Any]]:
+        """
+        Get all open orders, optionally filtered by underlying symbol.
+
+        For options, we check if the symbol contains the underlying.
+        """
+        try:
+            orders = self.get_orders(status='open', limit=500)
+            if underlying_symbol:
+                # Filter orders where symbol contains the underlying (e.g., COIN in COIN251212C00275000)
+                return [o for o in orders if underlying_symbol in o.get('symbol', '')]
+            return orders
+        except Exception as e:
+            print(f"Error getting open orders: {e}")
+            return []
+
+    def get_option_orders(
+        self,
+        underlying_symbol: str = None,
+        status: str = 'open'
+    ) -> List[Dict[str, Any]]:
+        """
+        Get option orders, filtered by underlying symbol and status.
+
+        Uses Alpaca's underlying symbol filter when available.
+        """
+        try:
+            # Get all orders and filter for options (symbols with option format)
+            all_orders = self.get_orders(status=status, limit=500)
+            option_orders = []
+
+            for order in all_orders:
+                symbol = order.get('symbol', '')
+                # Option symbols are longer (OCC format) and contain strike info
+                # e.g., COIN251212C00275000 (min 15 chars)
+                if len(symbol) >= 15:
+                    if underlying_symbol is None or underlying_symbol in symbol:
+                        option_orders.append(order)
+
+            return option_orders
+        except Exception as e:
+            print(f"Error getting option orders: {e}")
+            return []
+
     def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific order by ID."""
         try:
@@ -300,11 +359,24 @@ class AlpacaClient:
             quotes = self.stock_data_client.get_stock_latest_quote(request)
             if symbol in quotes:
                 q = quotes[symbol]
+                bid = float(q.bid_price) if q.bid_price else 0.0
+                ask = float(q.ask_price) if q.ask_price else 0.0
+
+                # Calculate mid price, handling cases where bid or ask is 0
+                if bid > 0 and ask > 0:
+                    mid = (bid + ask) / 2
+                elif bid > 0:
+                    mid = bid  # Use bid if no ask (market closed)
+                elif ask > 0:
+                    mid = ask  # Use ask if no bid
+                else:
+                    mid = 0.0
+
                 return Quote(
                     symbol=symbol,
-                    bid=float(q.bid_price),
-                    ask=float(q.ask_price),
-                    mid=(float(q.bid_price) + float(q.ask_price)) / 2,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
                     timestamp=q.timestamp,
                 )
         except Exception as e:
@@ -318,15 +390,63 @@ class AlpacaClient:
             quotes = self.option_data_client.get_option_latest_quote(request)
             if symbol in quotes:
                 q = quotes[symbol]
+                bid = float(q.bid_price) if q.bid_price else 0.0
+                ask = float(q.ask_price) if q.ask_price else 0.0
+
+                # Calculate mid price, handling cases where bid or ask is 0
+                if bid > 0 and ask > 0:
+                    mid = (bid + ask) / 2
+                elif bid > 0:
+                    mid = bid
+                elif ask > 0:
+                    mid = ask
+                else:
+                    mid = 0.0
+
                 return Quote(
                     symbol=symbol,
-                    bid=float(q.bid_price),
-                    ask=float(q.ask_price),
-                    mid=(float(q.bid_price) + float(q.ask_price)) / 2,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
                     timestamp=q.timestamp,
                 )
         except Exception as e:
             print(f"Error getting option quote for {symbol}: {e}")
+        return None
+
+    def get_option_greeks(self, symbol: str) -> Optional[OptionGreeks]:
+        """Get option Greeks from Alpaca snapshot (uses free indicative feed)."""
+        try:
+            request = OptionSnapshotRequest(
+                symbol_or_symbols=symbol,
+                feed=OptionsFeed.INDICATIVE  # Free feed with Greeks
+            )
+            snapshots = self.option_data_client.get_option_snapshot(request)
+            if symbol in snapshots:
+                snapshot = snapshots[symbol]
+                greeks = snapshot.greeks if hasattr(snapshot, 'greeks') and snapshot.greeks else None
+                if greeks:
+                    return OptionGreeks(
+                        delta=float(greeks.delta) if greeks.delta else 0.0,
+                        gamma=float(greeks.gamma) if greeks.gamma else 0.0,
+                        theta=float(greeks.theta) if greeks.theta else 0.0,
+                        vega=float(greeks.vega) if greeks.vega else 0.0,
+                        rho=float(greeks.rho) if greeks.rho else 0.0,
+                        implied_volatility=float(snapshot.implied_volatility) if hasattr(snapshot, 'implied_volatility') and snapshot.implied_volatility else 0.0
+                    )
+        except Exception as e:
+            print(f"Error getting option Greeks for {symbol}: {e}")
+        return None
+
+    def get_latest_stock_bar(self, symbol: str) -> Optional[Bar]:
+        """Get the latest 1-minute bar for a stock."""
+        try:
+            # Get the last bar
+            bars = self.get_stock_bars(symbol, timeframe='1Min', limit=1)
+            if bars:
+                return bars[-1]
+        except Exception as e:
+            print(f"Error getting latest bar for {symbol}: {e}")
         return None
 
     def get_stock_bars(
@@ -341,14 +461,19 @@ class AlpacaClient:
         if start is None:
             start = datetime.now(EST) - timedelta(hours=1)
 
-        tf = TimeFrame.Minute
-        if timeframe == '5Min':
+        # Alpaca TimeFrame handles different timeframes with amount parameter
+        if timeframe == '1Min':
             tf = TimeFrame.Minute
-            # Note: Alpaca uses multiplier for 5-min bars
+        elif timeframe == '5Min':
+            tf = TimeFrame(amount=5, unit=TimeFrameUnit.Minute)  # 5-minute bars
+        elif timeframe == '15Min':
+            tf = TimeFrame(amount=15, unit=TimeFrameUnit.Minute)  # 15-minute bars
         elif timeframe == '1Hour':
             tf = TimeFrame.Hour
         elif timeframe == '1Day':
             tf = TimeFrame.Day
+        else:
+            tf = TimeFrame.Minute
 
         try:
             request = StockBarsRequest(
@@ -358,10 +483,13 @@ class AlpacaClient:
                 end=end,
                 limit=limit,
             )
-            bars = self.stock_data_client.get_stock_bars(request)
+            bars_response = self.stock_data_client.get_stock_bars(request)
             result = []
-            if symbol in bars:
-                for b in bars[symbol]:
+
+            # BarSet can be accessed with [] notation
+            try:
+                symbol_bars = bars_response[symbol]
+                for b in symbol_bars:
                     result.append(Bar(
                         symbol=symbol,
                         open=float(b.open),
@@ -371,10 +499,110 @@ class AlpacaClient:
                         volume=int(b.volume),
                         timestamp=b.timestamp,
                     ))
+            except (KeyError, TypeError) as access_err:
+                print(f"[DEBUG] No bars found for {symbol} in response: {access_err}")
+
             return result
         except Exception as e:
             print(f"Error getting bars for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
             return []
+
+    def get_option_contracts(
+        self,
+        underlying_symbols: List[str] = None,
+        expiration_date: Optional[datetime] = None,
+        expiration_date_gte: Optional[datetime] = None,
+        expiration_date_lte: Optional[datetime] = None,
+        strike_price_gte: Optional[float] = None,
+        strike_price_lte: Optional[float] = None,
+        option_type: Optional[str] = None,  # 'call' or 'put'
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Get available options contracts from Alpaca's /v2/options/contracts endpoint.
+
+        Args:
+            underlying_symbols: List of underlying symbols (e.g., ['AAPL', 'TSLA'])
+            expiration_date: Exact expiration date
+            expiration_date_gte: Expiration date greater than or equal to
+            expiration_date_lte: Expiration date less than or equal to (default: next weekend)
+            strike_price_gte: Strike price greater than or equal to
+            strike_price_lte: Strike price less than or equal to
+            option_type: 'call' or 'put'
+            limit: Max number of contracts to return (default 100)
+
+        Returns:
+            List of option contract dicts with keys:
+            - id, symbol, name, status, tradable, expiration_date, root_symbol,
+            - underlying_symbol, type, style, strike_price, size, open_interest, close_price
+        """
+        import requests
+
+        # Build URL
+        base_url = "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+        url = f"{base_url}/v2/options/contracts"
+
+        # Build params
+        params = {'limit': limit}
+
+        if underlying_symbols:
+            params['underlying_symbols'] = ','.join(underlying_symbols)
+        if expiration_date:
+            params['expiration_date'] = expiration_date.strftime('%Y-%m-%d')
+        if expiration_date_gte:
+            params['expiration_date_gte'] = expiration_date_gte.strftime('%Y-%m-%d')
+        if expiration_date_lte:
+            params['expiration_date_lte'] = expiration_date_lte.strftime('%Y-%m-%d')
+        if strike_price_gte:
+            params['strike_price_gte'] = str(strike_price_gte)
+        if strike_price_lte:
+            params['strike_price_lte'] = str(strike_price_lte)
+        if option_type:
+            params['type'] = option_type.lower()
+
+        headers = {
+            'APCA-API-KEY-ID': self.api_key,
+            'APCA-API-SECRET-KEY': self.api_secret,
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('option_contracts', [])
+        except Exception as e:
+            print(f"Error getting option contracts: {e}")
+            return []
+
+    def get_option_contract(self, symbol_or_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get details for a single option contract.
+
+        Args:
+            symbol_or_id: OCC symbol (e.g., 'AAPL240119C00100000') or contract UUID
+
+        Returns:
+            Option contract dict or None
+        """
+        import requests
+
+        base_url = "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+        url = f"{base_url}/v2/options/contracts/{symbol_or_id}"
+
+        headers = {
+            'APCA-API-KEY-ID': self.api_key,
+            'APCA-API-SECRET-KEY': self.api_secret,
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"Error getting option contract {symbol_or_id}: {e}")
+            return None
 
     def get_option_chain(
         self,
@@ -385,16 +613,252 @@ class AlpacaClient:
         Get available options contracts for underlying.
 
         Returns list of OCC symbol strings.
+
+        Deprecated: Use get_option_contracts() instead for full details.
         """
-        # Alpaca options data requires specific API calls
-        # This is a simplified version - full implementation would query the options chain
+        contracts = self.get_option_contracts(
+            underlying_symbols=[underlying],
+            expiration_date=expiration_date
+        )
+        return [c.get('symbol', '') for c in contracts if c.get('symbol')]
+
+    # ==================== Options Order Methods ====================
+
+    def submit_option_market_order(
+        self,
+        symbol: str,  # OCC symbol format
+        qty: int,     # Must be whole number
+        side: str,    # 'buy' or 'sell'
+    ) -> Dict[str, Any]:
+        """
+        Submit a market order for an option contract.
+
+        Alpaca options constraints:
+        - qty must be whole number (no fractional contracts)
+        - time_in_force must be 'day'
+        - type must be 'market' or 'limit'
+        - extended_hours must be false
+
+        Args:
+            symbol: OCC symbol (e.g., 'AAPL240119C00100000')
+            qty: Number of contracts (whole number)
+            side: 'buy' or 'sell'
+
+        Returns:
+            Order details dict
+        """
+        order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+        # Ensure qty is a whole number
+        qty = int(qty)
+        if qty < 1:
+            raise ValueError("Options qty must be at least 1")
+
+        order_request = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            time_in_force=TimeInForce.DAY,  # Options must use DAY
+        )
+
+        order = self.trading_client.submit_order(order_request)
+        return self._order_to_dict(order)
+
+    def submit_option_limit_order(
+        self,
+        symbol: str,  # OCC symbol format
+        qty: int,     # Must be whole number
+        side: str,    # 'buy' or 'sell'
+        limit_price: float,
+    ) -> Dict[str, Any]:
+        """
+        Submit a limit order for an option contract.
+
+        Args:
+            symbol: OCC symbol (e.g., 'AAPL240119C00100000')
+            qty: Number of contracts (whole number)
+            side: 'buy' or 'sell'
+            limit_price: Limit price per contract
+
+        Returns:
+            Order details dict
+        """
+        order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+        # Ensure qty is a whole number
+        qty = int(qty)
+        if qty < 1:
+            raise ValueError("Options qty must be at least 1")
+
+        order_request = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            limit_price=limit_price,
+            time_in_force=TimeInForce.DAY,  # Options must use DAY
+        )
+
+        order = self.trading_client.submit_order(order_request)
+        return self._order_to_dict(order)
+
+    def submit_option_stop_order(
+        self,
+        symbol: str,  # OCC symbol format
+        qty: int,     # Must be whole number
+        side: str,    # 'buy' or 'sell'
+        stop_price: float,
+    ) -> Dict[str, Any]:
+        """
+        Submit a stop order for an option contract.
+        Used for stop-loss orders to sell when price drops to stop_price.
+
+        Args:
+            symbol: OCC symbol (e.g., 'AAPL240119C00100000')
+            qty: Number of contracts (whole number)
+            side: 'buy' or 'sell'
+            stop_price: Stop trigger price
+
+        Returns:
+            Order details dict
+        """
+        order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+        # Ensure qty is a whole number
+        qty = int(qty)
+        if qty < 1:
+            raise ValueError("Options qty must be at least 1")
+
+        order_request = StopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            stop_price=stop_price,
+            time_in_force=TimeInForce.DAY,  # Options must use DAY
+        )
+
+        order = self.trading_client.submit_order(order_request)
+        return self._order_to_dict(order)
+
+    def submit_option_stop_limit_order(
+        self,
+        symbol: str,  # OCC symbol format
+        qty: int,     # Must be whole number
+        side: str,    # 'buy' or 'sell'
+        stop_price: float,
+        limit_price: float,
+    ) -> Dict[str, Any]:
+        """
+        Submit a stop-limit order for an option contract.
+
+        Args:
+            symbol: OCC symbol (e.g., 'AAPL240119C00100000')
+            qty: Number of contracts (whole number)
+            side: 'buy' or 'sell'
+            stop_price: Stop trigger price
+            limit_price: Limit price after stop triggered
+
+        Returns:
+            Order details dict
+        """
+        order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+        # Ensure qty is a whole number
+        qty = int(qty)
+        if qty < 1:
+            raise ValueError("Options qty must be at least 1")
+
+        order_request = StopLimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            stop_price=stop_price,
+            limit_price=limit_price,
+            time_in_force=TimeInForce.DAY,  # Options must use DAY
+        )
+
+        order = self.trading_client.submit_order(order_request)
+        return self._order_to_dict(order)
+
+    def get_options_positions(self) -> List[Dict[str, Any]]:
+        """
+        Get all open options positions.
+
+        Returns positions filtered to options asset class.
+        """
         try:
-            # For now, construct expected OCC symbols based on typical format
-            # Full implementation would use Alpaca's options chain endpoint
-            return []
+            positions = self.trading_client.get_all_positions()
+            options_positions = []
+            for pos in positions:
+                # Options positions have asset_class = 'us_option'
+                if hasattr(pos, 'asset_class') and str(pos.asset_class).lower() == 'us_option':
+                    options_positions.append({
+                        'symbol': pos.symbol,
+                        'qty': int(float(pos.qty)),
+                        'side': pos.side,
+                        'avg_entry_price': float(pos.avg_entry_price),
+                        'market_value': float(pos.market_value),
+                        'unrealized_pl': float(pos.unrealized_pl),
+                        'unrealized_plpc': float(pos.unrealized_plpc) * 100,
+                        'current_price': float(pos.current_price),
+                        'asset_class': 'us_option',
+                    })
+            return options_positions
         except Exception as e:
-            print(f"Error getting option chain: {e}")
+            print(f"Error getting options positions: {e}")
             return []
+
+    def get_position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific position by symbol (more reliable than get_all_positions).
+
+        Uses the direct /positions/{symbol} endpoint which is more reliable
+        than filtering from get_all_positions.
+
+        Args:
+            symbol: The OCC option symbol (e.g., 'COIN251212C00275000')
+
+        Returns:
+            Position dict or None if not found
+        """
+        try:
+            pos = self.trading_client.get_open_position(symbol)
+            if pos:
+                return {
+                    'symbol': pos.symbol,
+                    'qty': int(float(pos.qty)),
+                    'side': pos.side,
+                    'avg_entry_price': float(pos.avg_entry_price),
+                    'market_value': float(pos.market_value),
+                    'unrealized_pl': float(pos.unrealized_pl),
+                    'unrealized_plpc': float(pos.unrealized_plpc) * 100,
+                    'current_price': float(pos.current_price),
+                    'asset_class': str(getattr(pos, 'asset_class', 'unknown')),
+                }
+            return None
+        except Exception as e:
+            # 404 means no position exists for this symbol - not an error
+            if '404' in str(e) or 'not found' in str(e).lower():
+                return None
+            print(f"Error getting position for {symbol}: {e}")
+            return None
+
+    def get_account_options_info(self) -> Dict[str, Any]:
+        """
+        Get options-specific account information.
+
+        Returns:
+            Dict with options_approved_level, options_trading_level, etc.
+        """
+        try:
+            account = self.trading_client.get_account()
+            return {
+                'options_approved_level': getattr(account, 'options_approved_level', None),
+                'options_trading_level': getattr(account, 'options_trading_level', None),
+                'options_buying_power': getattr(account, 'options_buying_power', None),
+            }
+        except Exception as e:
+            print(f"Error getting options account info: {e}")
+            return {}
 
     # ==================== Streaming ====================
 
@@ -459,11 +923,24 @@ class AlpacaClient:
             quotes = self.crypto_data_client.get_crypto_latest_quote(request)
             if symbol in quotes:
                 q = quotes[symbol]
+                bid = float(q.bid_price) if q.bid_price else 0.0
+                ask = float(q.ask_price) if q.ask_price else 0.0
+
+                # Calculate mid price, handling cases where bid or ask is 0
+                if bid > 0 and ask > 0:
+                    mid = (bid + ask) / 2
+                elif bid > 0:
+                    mid = bid
+                elif ask > 0:
+                    mid = ask
+                else:
+                    mid = 0.0
+
                 return Quote(
                     symbol=symbol,
-                    bid=float(q.bid_price),
-                    ask=float(q.ask_price),
-                    mid=(float(q.bid_price) + float(q.ask_price)) / 2,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
                     timestamp=q.timestamp,
                 )
         except Exception as e:
@@ -512,8 +989,9 @@ class AlpacaClient:
             )
             bars = self.crypto_data_client.get_crypto_bars(request)
             result = []
-            if symbol in bars:
-                for b in bars[symbol]:
+            # BarSet uses .data attribute for symbol lookup
+            if hasattr(bars, 'data') and symbol in bars.data:
+                for b in bars.data[symbol]:
                     result.append(Bar(
                         symbol=symbol,
                         open=float(b.open),
@@ -570,10 +1048,12 @@ class AlpacaClient:
             )
             bars_data = self.crypto_data_client.get_crypto_bars(request)
             result = {}
+            # BarSet uses .data attribute for symbol lookup
+            data_dict = bars_data.data if hasattr(bars_data, 'data') else {}
             for symbol in symbols:
                 result[symbol] = []
-                if symbol in bars_data:
-                    for b in bars_data[symbol]:
+                if symbol in data_dict:
+                    for b in data_dict[symbol]:
                         result[symbol].append(Bar(
                             symbol=symbol,
                             open=float(b.open),
@@ -654,6 +1134,56 @@ class AlpacaClient:
             symbol=symbol,
             qty=qty,
             side=order_side,
+            limit_price=limit_price,
+            time_in_force=TimeInForce.GTC,
+        )
+
+        order = self.trading_client.submit_order(order_request)
+        return self._order_to_dict(order)
+
+    def submit_crypto_stop_limit_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        stop_price: float,
+        limit_price: float = None
+    ) -> Dict[str, Any]:
+        """
+        Submit a stop-limit order for cryptocurrency.
+
+        Alpaca crypto only supports: Market, Limit, and Stop-Limit orders.
+        This is a stop-limit order that triggers when price hits stop_price,
+        then places a limit order at limit_price.
+
+        Args:
+            symbol: Crypto symbol (e.g., 'BTC/USD')
+            qty: Quantity (fractional allowed)
+            side: 'sell' for stop-loss on long position
+            stop_price: Price at which the stop triggers
+            limit_price: Limit price for the order (default: slightly below stop for sells)
+
+        Returns:
+            Order details dict
+        """
+        from alpaca.trading.requests import StopLimitOrderRequest
+
+        order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+        # If no limit price specified, set it slightly below/above stop for execution
+        if limit_price is None:
+            if side.lower() == 'sell':
+                # For sell stop-loss, set limit slightly below stop to ensure fill
+                limit_price = stop_price * 0.995  # 0.5% below stop
+            else:
+                # For buy stop, set limit slightly above stop
+                limit_price = stop_price * 1.005  # 0.5% above stop
+
+        order_request = StopLimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            stop_price=stop_price,
             limit_price=limit_price,
             time_in_force=TimeInForce.GTC,
         )

@@ -288,12 +288,15 @@ async def fetch_binance_data(symbol: str, start_date: datetime, end_date: dateti
 def download_multi_symbol_data(symbols: List[str], days: int, interval: str = '1m') -> pd.DataFrame:
     """
     Download data for all symbols with robust caching.
-    
+
     Uses centralized data fetcher and organized cache.
     """
+    print(">>> Importing DataCache...", flush=True)
     from trading_system.ml.data_cache import DataCache
+    print(">>> Importing data_fetcher...", flush=True)
     from trading_system.data.data_fetcher import get_data_fetcher
-    
+    print(">>> Imports done, creating cache...", flush=True)
+
     cache = DataCache()
     cache.print_cache_info()
     
@@ -332,15 +335,18 @@ def download_multi_symbol_data(symbols: List[str], days: int, interval: str = '1
     combined_df = combined_df.sort_values(['symbol', 'timestamp']).reset_index(drop=True)
     
     logger.info(f"✅ COMBINED RAW DATA: {len(combined_df):,} total bars")
-    
+
     # Apply data quality checks with caching
     logger.info("\n🧹 APPLYING DATA QUALITY CHECKS...")
+    print(">>> About to import data_quality...", flush=True)
     from trading_system.ml.data_quality import clean_training_data
-    
+    print(">>> data_quality imported OK", flush=True)
+
     # Try to load cleaned data from cache
     cleaned_data = []
     need_cleaning = []
-    
+
+    print(">>> Checking cleaned cache for each symbol...", flush=True)
     for symbol in symbols:
         df_cleaned = cache.get_cleaned_data(symbol, start_date_str, end_date_str, interval)
         if df_cleaned is not None:
@@ -654,54 +660,61 @@ def label_data_with_strategy_logic(df: pd.DataFrame, target_profit_pct: float = 
 def train_ensemble_model(df: pd.DataFrame, optimize: bool = False, output_path: str = "models/crypto_scalping_ensemble.pkl"):
     """
     Train ML ensemble model with proper train/validation/test split.
-    
+
     ANTI-OVERFITTING MEASURES:
     - Chronological split (no future data leakage)
     - Separate validation set for hyperparameter tuning
     - Test set never seen during training
     - Cross-validation on training set only
     """
+    print(">>> [train_ensemble_model] Starting...", flush=True)
+    print(">>> [train_ensemble_model] Importing training modules...", flush=True)
     try:
         from trading_system.ml.training.data_pipeline import DataPipeline
         from trading_system.ml.training.trainer import EnsembleTrainer
-    except ImportError:
-        logger.error("❌ ML modules not found. Make sure trading_system/ml is available.")
+        print(">>> [train_ensemble_model] Imports OK", flush=True)
+    except ImportError as e:
+        logger.error(f"❌ ML modules not found: {e}")
         sys.exit(1)
-    
+
     logger.info("=" * 80)
     logger.info("🚀 TRAINING ML ENSEMBLE MODEL (WITH ANTI-OVERFITTING)")
     logger.info("=" * 80)
-    
+
     # CRITICAL: Chronological split to prevent data leakage
     # Train on older data, validate on middle data, test on newest data
     total_rows = len(df)
     train_end = int(total_rows * 0.70)    # 70% training
     val_end = int(total_rows * 0.85)      # 15% validation
     # Remaining 15% for test
-    
+
     logger.info(f"📊 Data Split (Chronological - NO LEAKAGE):")
     logger.info(f"   Training:   {train_end:,} rows (70%)")
     logger.info(f"   Validation: {val_end - train_end:,} rows (15%)")
     logger.info(f"   Test:       {total_rows - val_end:,} rows (15%)")
-    
+
     # Save data temporarily
+    print(">>> [train_ensemble_model] Saving temp CSV file...", flush=True)
     temp_file = "temp_multi_crypto_data.csv"
     df.to_csv(temp_file, index=False)
     logger.info(f"💾 Saved training data: {temp_file}")
-    
+    print(">>> [train_ensemble_model] CSV saved, initializing trainer...", flush=True)
+
     # Initialize trainer
     trainer = EnsembleTrainer()
-    
+    print(">>> [train_ensemble_model] Trainer initialized, starting training...", flush=True)
+
     # Train model
     logger.info("🎯 Training ensemble with 5 models (RF, XGBoost, LSTM, LR, SVM)...")
     logger.info("   Using SMOTE for class balancing (prevents overfitting to majority class)")
     logger.info("   Cross-validation on training set only (no future peeking)")
-    
+
     ensemble = trainer.train_from_file(
         data_path=temp_file,
         optimize_hyperparams=optimize,
         model_name=output_path.replace('.pkl', '').replace('models/', '')
     )
+    print(">>> [train_ensemble_model] Training complete!", flush=True)
 
     # Save to the specified path
     ensemble.save(output_path)
@@ -719,15 +732,18 @@ def train_ensemble_model(df: pd.DataFrame, optimize: bool = False, output_path: 
 
 
 def main():
+    print(">>> MAIN STARTING...", flush=True)
     parser = argparse.ArgumentParser(description="Train ML Ensemble for Multi-Crypto Scalping Strategy on 1-MINUTE DATA")
     parser.add_argument('--days', type=int, default=30, help='Days of historical data (default: 30, max 30 for 1m data)')
     parser.add_argument('--interval', type=str, default='1m', choices=['1m', '5m', '15m', '1h'], help='Data interval - USE 1m to match backtest! (default: 1m)')
     parser.add_argument('--optimize', action='store_true', help='Enable hyperparameter optimization (slower)')
     parser.add_argument('--output', type=str, default='models/crypto_scalping_ensemble.pkl', help='Output model path')
     parser.add_argument('--symbols', type=str, nargs='+', help='Specific symbols to train on (default: all 9)')
-    
+
+    print(">>> Parsing args...", flush=True)
     args = parser.parse_args()
-    
+    print(">>> Args parsed OK", flush=True)
+
     # Enforce 1m interval warning
     if args.interval != '1m':
         logger.warning("⚠️" * 40)
@@ -739,10 +755,11 @@ def main():
         if response.lower() != 'y':
             logger.info("Training cancelled. Use --interval 1m")
             sys.exit(0)
-    
+
     # Use specified symbols or all
     symbols = args.symbols if args.symbols else CRYPTO_SYMBOLS
-    
+
+    print(">>> About to log header...", flush=True)
     logger.info("=" * 80)
     logger.info("🤖 MULTI-CRYPTO ML ENSEMBLE TRAINING (1-MINUTE DATA)")
     logger.info("=" * 80)
@@ -754,13 +771,17 @@ def main():
     logger.info(f"Data Caching: ENABLED (data/raw, data/cleaned, data/features)")
     logger.info(f"Data Quality: ENABLED (synthetic fill for NaN/invalid values)")
     logger.info("=" * 80)
-    
+    print(">>> Header logged, calculating dates...", flush=True)
+
     # Calculate date range
     end_date_str = datetime.now().strftime('%Y-%m-%d')
     start_date_str = (datetime.now() - timedelta(days=args.days)).strftime('%Y-%m-%d')
-    
+    print(f">>> Dates: {start_date_str} to {end_date_str}", flush=True)
+
     # Step 1: Download data (with caching)
+    print(">>> STEP 1: Calling download_multi_symbol_data...", flush=True)
     df = download_multi_symbol_data(symbols, args.days, args.interval)
+    print(f">>> STEP 1 DONE: Got {len(df)} rows", flush=True)
     
     # Step 2: Calculate indicators (with caching)
     df = calculate_strategy_indicators(df, symbols, start_date_str, end_date_str, args.interval)

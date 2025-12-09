@@ -24,6 +24,8 @@ from ..config.live_trading_config import (
 )
 from .alpaca_client import AlpacaClient, Quote, Bar, ALPACA_AVAILABLE
 from ..strategies import COINDaily0DTEMomentum, COINDaily0DTEMomentumConfig
+from ..analytics.options_trade_logger import OptionsTradeLogger, get_options_trade_logger
+from ..data.options_market_collector import OptionsMarketCollector, get_options_market_collector
 
 
 EST = pytz.timezone('America/New_York')
@@ -132,6 +134,10 @@ class LiveTradingEngine:
         self.entry_end = datetime.strptime(config.entry_time_end, "%H:%M:%S").time()
         self.force_exit = datetime.strptime(config.force_exit_time, "%H:%M:%S").time()
 
+        # Trade logging and market data collection
+        self.trade_logger: OptionsTradeLogger = get_options_trade_logger()
+        self.market_collector: OptionsMarketCollector = get_options_market_collector()
+
     def _log(self, msg: str, level: str = "INFO"):
         """Log message with timestamp."""
         now = datetime.now(EST)
@@ -203,18 +209,131 @@ class LiveTradingEngine:
         return friday.replace(hour=16, minute=0, second=0, microsecond=0)
 
     def _calculate_signal(self) -> str:
-        """Calculate trading signal based on current market conditions."""
-        if not self.latest_underlying_bar:
+        """
+        Calculate trading signal using DUAL CONFIRMATION from strategy.
+
+        METHOD 1: Technical Scoring (EMA, VWAP, RSI, MACD, BB, Volume) - 1-MIN BARS
+        METHOD 2: Price Action (candle patterns, higher highs/lows, momentum) - 5-MIN BARS
+
+        Only trades when BOTH methods agree on the same direction.
+
+        Returns: 'BULLISH', 'BEARISH', or 'NEUTRAL'
+        """
+        # Get 1-MINUTE bars for Technical Scoring (Method 1)
+        start_time = datetime.now(EST) - timedelta(hours=3)
+        bars_1min = self.client.get_stock_bars(
+            self.config.underlying_symbol,
+            timeframe='1Min',
+            start=start_time,
+            limit=180
+        )
+
+        if not bars_1min or len(bars_1min) < 30:
+            bars_count = len(bars_1min) if bars_1min else 0
+            self._log(f"Not enough 1-min bar data for analysis ({bars_count} bars, need 30) - SKIPPING TRADE", "WARN")
             return 'NEUTRAL'
 
-        bar = self.latest_underlying_bar
+        # Use last 60 bars for 1-min
+        bars_1min = bars_1min[-60:]
 
-        if bar.close > bar.open:
-            return 'BULLISH'
-        elif bar.close < bar.open:
-            return 'BEARISH'
+        # Get 5-MINUTE bars for Price Action (Method 2)
+        # Need 60 5-min bars = 5 hours of data, fetch 6 hours to be safe
+        start_time_5min = datetime.now(EST) - timedelta(hours=6)
+        bars_5min = self.client.get_stock_bars(
+            self.config.underlying_symbol,
+            timeframe='5Min',
+            start=start_time_5min,
+            limit=100
+        )
+
+        if not bars_5min or len(bars_5min) < 12:
+            bars_count = len(bars_5min) if bars_5min else 0
+            self._log(f"Not enough 5-min bar data for Price Action ({bars_count} bars, need 12) - SKIPPING TRADE", "WARN")
+            return 'NEUTRAL'
+
+        # Use last 30 bars for 5-min (2.5 hours of data)
+        bars_5min = bars_5min[-30:]
+
+        # ============================================================
+        # DUAL SIGNAL VALIDATION
+        # ============================================================
+        self._log("=" * 65, "INFO")
+        self._log("  DUAL SIGNAL VALIDATION", "INFO")
+        self._log("=" * 65, "INFO")
+
+        # ========== METHOD 1: Technical Scoring (1-MIN BARS) ==========
+        tech_result = COINDaily0DTEMomentum.calculate_signal_from_bars(bars_1min)
+        tech_signal = tech_result['signal']
+        tech_confidence = tech_result['confidence']
+        indicators = tech_result.get('indicators', {})
+
+        self._log("  METHOD 1 - Technical Scoring (1-MIN):", "INFO")
+        if indicators:
+            self._log(f"    Price: ${indicators.get('price', 0):.2f} | VWAP: ${indicators.get('vwap', 0):.2f}", "INFO")
+            self._log(f"    EMA9: ${indicators.get('ema_9', 0):.2f} | EMA20: ${indicators.get('ema_20', 0):.2f}", "INFO")
+            self._log(f"    RSI: {indicators.get('rsi', 0):.1f} | MACD: {indicators.get('macd_line', 0):.3f}", "INFO")
+
+        self._log(f"    Signal: {tech_signal} | Score: {tech_result['bullish_score']}/17 vs {tech_result['bearish_score']}/17 | Confidence: {tech_confidence}", "INFO")
+
+        # Log bullish signals
+        for sig in tech_result.get('bullish_signals', []):
+            self._log(f"      + {sig}", "TRADE")
+        # Log bearish signals
+        for sig in tech_result.get('bearish_signals', []):
+            self._log(f"      - {sig}", "WARN")
+
+        self._log("-" * 65, "INFO")
+
+        # ========== METHOD 2: Price Action (5-MIN BARS) ==========
+        pa_result = COINDaily0DTEMomentum.calculate_price_action_signal(bars_5min)
+        pa_signal = pa_result['signal']
+        pa_strength = pa_result['strength']
+
+        self._log("  METHOD 2 - Price Action (5-MIN):", "INFO")
+        self._log(f"    Signal: {pa_signal} | Strength: {pa_strength} | Points: {pa_result['bullish_points']} bull vs {pa_result['bearish_points']} bear", "INFO")
+
+        for reason in pa_result.get('reasons', []):
+            if 'bullish' in reason.lower() or 'green' in reason.lower() or 'higher' in reason.lower() or 'above' in reason.lower() or 'uptrend' in reason.lower() or '+' in reason:
+                self._log(f"      + {reason}", "TRADE")
+            elif 'bearish' in reason.lower() or 'red' in reason.lower() or 'lower' in reason.lower() or 'below' in reason.lower() or 'downtrend' in reason.lower():
+                self._log(f"      - {reason}", "WARN")
+            else:
+                self._log(f"      * {reason}", "INFO")
+
+        self._log("-" * 65, "INFO")
+
+        # ========== FINAL DECISION ==========
+        self._log("  FINAL DECISION:", "INFO")
+
+        # Both must agree for confirmed signal
+        if tech_signal == 'BULLISH' and pa_signal == 'BULLISH':
+            final_signal = 'BULLISH'
+            self._log(f"    CONFIRMED BULLISH - BOTH METHODS AGREE", "TRADE")
+            self._log(f"    Technical: {tech_signal} ({tech_confidence}) | Price Action: {pa_signal} ({pa_strength})", "TRADE")
+            self._log(f"    >>> EXECUTING: BUY CALLS", "TRADE")
+
+        elif tech_signal == 'BEARISH' and pa_signal == 'BEARISH':
+            final_signal = 'BEARISH'
+            self._log(f"    CONFIRMED BEARISH - BOTH METHODS AGREE", "DANGER")
+            self._log(f"    Technical: {tech_signal} ({tech_confidence}) | Price Action: {pa_signal} ({pa_strength})", "DANGER")
+            self._log(f"    >>> EXECUTING: BUY PUTS", "DANGER")
+
+        elif tech_signal == 'NEUTRAL' or pa_signal == 'NEUTRAL':
+            final_signal = 'NEUTRAL'
+            self._log(f"    NO TRADE - One or both methods neutral", "INFO")
+            self._log(f"    Technical: {tech_signal} | Price Action: {pa_signal}", "INFO")
+            self._log(f"    >>> SKIPPING TRADE", "INFO")
+
         else:
-            return 'NEUTRAL'
+            # Conflicting signals
+            final_signal = 'NEUTRAL'
+            self._log(f"    CONFLICTING SIGNALS - NO TRADE", "WARN")
+            self._log(f"    Technical: {tech_signal} ({tech_confidence}) | Price Action: {pa_signal} ({pa_strength})", "WARN")
+            self._log(f"    >>> SKIPPING TRADE (signals disagree)", "WARN")
+
+        self._log("=" * 65, "INFO")
+
+        return final_signal
 
     def _find_atm_option(self, option_type: str) -> Optional[str]:
         """Find ATM option contract for the underlying."""
@@ -362,10 +481,43 @@ class LiveTradingEngine:
                      f"TP=${self.session.position.take_profit_price:.2f}, "
                      f"SL=${self.session.position.stop_loss_price:.2f}", "TRADE")
 
+            # Place TAKE PROFIT limit order on the exchange
+            # NOTE: Alpaca only supports MARKET and LIMIT orders for options (no STOP orders)
+            # So we place TP as limit order, and monitor SL internally
+            self._log(f"    Submitting TAKE PROFIT limit order to Alpaca...", "TRADE")
+            tp_placed = False
+            max_retries = 3
+            tp_price = self.session.position.take_profit_price
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    tp_order = self.client.submit_option_limit_order(
+                        symbol=occ_symbol,
+                        qty=qty,
+                        side='sell',
+                        limit_price=round(tp_price, 2),
+                    )
+                    tp_order_id = tp_order.get('id', 'N/A')
+                    tp_order_status = tp_order.get('status', 'unknown')
+                    self.session.position.tp_order_id = tp_order_id
+                    tp_placed = True
+                    self._log(f"    TP limit order placed: {tp_order_id} @ ${tp_price:.2f} (status: {tp_order_status})", "TRADE")
+                    break
+                except Exception as tp_err:
+                    self._log(f"    TP order attempt {attempt}/{max_retries} failed: {tp_err}", "WARN")
+                    if attempt < max_retries:
+                        import time
+                        time.sleep(1)
+
+            if not tp_placed:
+                self._log("    WARNING: TP limit order failed - will monitor TP internally", "WARN")
+
+            self._log(f"    SL will be monitored internally @ ${self.session.position.stop_loss_price:.2f}", "TRADE")
+
             self.session.has_traded_today = True
             self.session.trades_today += 1
 
-            # Log trade
+            # Log trade (original simple logging)
             log_trade({
                 'type': 'ENTRY',
                 'symbol': occ_symbol,
@@ -379,6 +531,32 @@ class LiveTradingEngine:
                 'timestamp': datetime.now(EST).isoformat(),
             })
 
+            # Log trade entry to comprehensive logger
+            try:
+                trade_id = f"LIVE_{occ_symbol}_{datetime.now(EST).strftime('%Y%m%d_%H%M%S')}"
+                expiry_str = self.session.position.expiration.strftime("%Y-%m-%d") if isinstance(self.session.position.expiration, datetime) else str(self.session.position.expiration)[:10]
+
+                self.trade_logger.log_entry(
+                    trade_id=trade_id,
+                    underlying_symbol=self.config.underlying_symbol,
+                    option_symbol=occ_symbol,
+                    option_type='call' if option_type == 'C' else 'put',
+                    strike_price=self.session.position.strike,
+                    expiration_date=expiry_str,
+                    entry_time=datetime.now(EST),
+                    entry_price=option_quote.ask,
+                    entry_qty=qty,
+                    entry_order_id=order['id'],
+                    entry_underlying_price=self.latest_underlying_quote.mid if self.latest_underlying_quote else 0.0,
+                    target_profit_pct=self.config.target_profit_pct,
+                    stop_loss_pct=self.config.stop_loss_pct,
+                    notes="LIVE TRADING"
+                )
+                # Store trade_id for exit logging
+                self.session.position.entry_order_id = trade_id
+            except Exception as log_err:
+                self._log(f"Error logging trade entry: {log_err}", "WARN")
+
         except Exception as e:
             self._log(f"ERROR EXECUTING TRADE: {e}", "ERROR")
 
@@ -388,6 +566,20 @@ class LiveTradingEngine:
             return
 
         pos = self.session.position
+
+        # FIRST: Check if TP order has filled (Alpaca limit order)
+        if pos.tp_order_id:
+            try:
+                tp_order = self.client.get_order(pos.tp_order_id)
+                if tp_order and tp_order.get('status') == 'filled':
+                    # TP order filled! Log the exit and clear position
+                    fill_price = float(tp_order.get('filled_avg_price', pos.take_profit_price))
+                    pnl_dollars = (fill_price - pos.entry_price) * pos.qty * 100
+                    self._log(f"TP LIMIT ORDER FILLED @ ${fill_price:.2f}!", "TRADE")
+                    self._handle_tp_filled(fill_price, pnl_dollars, tp_order.get('id', ''))
+                    return
+            except Exception as e:
+                self._log(f"Error checking TP order status: {e}", "WARN")
 
         # Get current option price
         option_quote = self.client.get_latest_option_quote(pos.symbol)
@@ -404,24 +596,84 @@ class LiveTradingEngine:
 
         exit_reason = None
 
-        # Check take profit
+        # Check take profit (TP limit order may have filled on exchange)
+        # NOTE: If TP order filled, this is redundant but ensures we handle it
         if current_price >= pos.take_profit_price:
             exit_reason = "TAKE_PROFIT"
 
-        # Check stop loss
+        # Check stop loss (monitored internally - no stop orders for options on Alpaca)
         elif current_price <= pos.stop_loss_price:
             exit_reason = "STOP_LOSS"
 
-        # Check max hold time
-        elif (datetime.now(EST) - pos.entry_time).total_seconds() / 60 >= self.config.max_hold_minutes:
-            exit_reason = "TIME_EXIT"
-
-        # Check force exit time
+        # Check force exit time (3:45 PM EST) - TIME_EXIT removed per strategy
         elif self._should_force_exit():
             exit_reason = "FORCE_EXIT"
 
         if exit_reason:
             self._exit_position(exit_reason, current_price, pnl_dollars)
+
+    def _handle_tp_filled(self, fill_price: float, pnl: float, order_id: str):
+        """Handle when TP limit order fills on exchange - no need to submit sell order."""
+        if self.session.position is None:
+            return
+
+        pos = self.session.position
+        hold_time = (datetime.now(EST) - pos.entry_time).total_seconds() / 60
+        pnl_pct = ((fill_price - pos.entry_price) / pos.entry_price) * 100
+
+        self._log("=" * 50, "TRADE")
+        self._log("TAKE PROFIT FILLED (Limit Order on Exchange)", "TRADE")
+        self._log("=" * 50, "TRADE")
+        self._log(f"Option: {pos.symbol}", "TRADE")
+        self._log(f"Entry Price: ${pos.entry_price:.2f}", "TRADE")
+        self._log(f"Exit Price: ${fill_price:.2f} (TP LIMIT FILL)", "TRADE")
+        self._log(f"Hold Time: {hold_time:.1f} minutes", "TRADE")
+        self._log(f"P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)", "TRADE")
+
+        # Update session and config
+        self.session.pnl_today += pnl
+        self.config.record_trade(pnl)
+
+        self._log(f"Session P&L: ${self.session.pnl_today:.2f}", "TRADE")
+        self._log("=" * 50, "TRADE")
+
+        # Log trade (original simple logging)
+        log_trade({
+            'type': 'EXIT',
+            'symbol': pos.symbol,
+            'reason': 'TAKE_PROFIT',
+            'qty': pos.qty,
+            'entry_price': pos.entry_price,
+            'exit_price': fill_price,
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'hold_time_minutes': hold_time,
+            'order_id': order_id,
+            'timestamp': datetime.now(EST).isoformat(),
+        })
+
+        # Log trade exit to comprehensive logger
+        try:
+            self.trade_logger.log_exit(
+                trade_id=pos.entry_order_id,
+                exit_time=datetime.now(EST),
+                exit_price=fill_price,
+                exit_qty=pos.qty,
+                exit_order_id=order_id,
+                exit_reason="TAKE_PROFIT",
+                exit_underlying_price=self.latest_underlying_quote.mid if self.latest_underlying_quote else 0.0,
+                notes=f"LIVE TRADING - TP Limit Order Filled - Hold time: {hold_time:.1f}m"
+            )
+        except Exception as log_err:
+            self._log(f"Error logging trade exit: {log_err}", "WARN")
+
+        # Check if we hit daily loss limit
+        if self.session.pnl_today <= -self.config.max_daily_loss:
+            self._log(f"DAILY LOSS LIMIT REACHED: ${self.session.pnl_today:.2f}", "DANGER")
+            self.session.stopped_by_limit = True
+            self.session.stop_reason = f"Daily loss limit (${self.config.max_daily_loss:.2f})"
+
+        self.session.position = None
 
     def _exit_position(self, reason: str, exit_price: float, pnl: float):
         """Exit the current position."""
@@ -431,6 +683,19 @@ class LiveTradingEngine:
         pos = self.session.position
 
         self._log(f"LIVE EXIT SIGNAL: {reason} @ ${exit_price:.2f} (P&L: ${pnl:.2f})", "TRADE")
+
+        # Cancel the take profit order before exiting (unless exit is due to TP filling)
+        # We have TP limit order on exchange, SL is monitored internally
+        if pos.tp_order_id and reason != "TAKE_PROFIT":
+            self._log(f"    Cancelling take profit order {pos.tp_order_id}...", "TRADE")
+            try:
+                cancelled = self.client.cancel_order(pos.tp_order_id)
+                if cancelled:
+                    self._log(f"    TP order cancelled successfully", "TRADE")
+                else:
+                    self._log(f"    TP order cancel returned False (may already be filled)", "WARN")
+            except Exception as cancel_err:
+                self._log(f"    Error cancelling TP order: {cancel_err}", "WARN")
 
         # Confirmation for exits too (if enabled)
         if self.config.require_confirmation and reason not in ["STOP_LOSS", "FORCE_EXIT"]:
@@ -456,7 +721,7 @@ class LiveTradingEngine:
             self._log(f"LIVE POSITION CLOSED: P&L=${pnl:.2f}, Hold={hold_time:.1f}m, "
                      f"Session P&L=${self.session.pnl_today:.2f}", "TRADE")
 
-            # Log trade
+            # Log trade (original simple logging)
             log_trade({
                 'type': 'EXIT',
                 'symbol': pos.symbol,
@@ -470,6 +735,21 @@ class LiveTradingEngine:
                 'order_id': order['id'],
                 'timestamp': datetime.now(EST).isoformat(),
             })
+
+            # Log trade exit to comprehensive logger
+            try:
+                self.trade_logger.log_exit(
+                    trade_id=pos.entry_order_id,  # We stored trade_id here during entry
+                    exit_time=datetime.now(EST),
+                    exit_price=exit_price,
+                    exit_qty=pos.qty,
+                    exit_order_id=order['id'],
+                    exit_reason=reason,
+                    exit_underlying_price=self.latest_underlying_quote.mid if self.latest_underlying_quote else 0.0,
+                    notes=f"LIVE TRADING - Hold time: {hold_time:.1f}m"
+                )
+            except Exception as log_err:
+                self._log(f"Error logging trade exit: {log_err}", "WARN")
 
             # Check if we hit daily loss limit
             if self.session.pnl_today <= -self.config.max_daily_loss:
@@ -524,8 +804,8 @@ class LiveTradingEngine:
         self._log(f"Max Position: ${self.config.max_position_value:,.2f}")
         self._log(f"Max Daily Loss: ${self.config.max_daily_loss:,.2f}")
         self._log(f"Max Trades/Day: {self.max_trades_per_day} (from strategy)")
-        self._log(f"Take Profit: {self.config.target_profit_pct}%")
-        self._log(f"Stop Loss: {self.config.stop_loss_pct}%")
+        self._log(f"Take Profit: {self.config.target_profit_pct}% (LIMIT ORDER on exchange)")
+        self._log(f"Stop Loss: {self.config.stop_loss_pct}% (monitored internally)")
         self._log(f"Entry Window: {self.config.entry_time_start} - {self.config.entry_time_end} EST")
         self._log(f"Confirm Trades: {'Yes' if self.config.require_confirmation else 'No'}")
         self._log("=" * 50)
@@ -632,6 +912,12 @@ class LiveTradingEngine:
         if self.session.stopped_by_limit:
             print(f"  Stopped: {self.session.stop_reason}")
         print("=" * 60)
+
+        # Print trade logger summary
+        try:
+            self.trade_logger.print_summary()
+        except Exception as e:
+            self._log(f"Error printing trade summary: {e}", "WARN")
 
 
 def run_live_trading(config: LiveTradingConfig):

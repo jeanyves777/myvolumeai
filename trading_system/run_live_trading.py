@@ -90,13 +90,17 @@ def display_config(config: LiveTradingConfig):
     print(f"  Max Position:     ${config.max_position_value:,.2f}")
     print(f"  Max Daily Loss:   ${config.max_daily_loss:,.2f}")
     print(f"  Max Trades/Day:   {config.max_trades_per_day}")
-    print(f"  Take Profit:      {config.target_profit_pct}%")
-    print(f"  Stop Loss:        {config.stop_loss_pct}%")
-    print(f"  Max Hold Time:    {config.max_hold_minutes} min")
+    print(f"  Take Profit:      {config.target_profit_pct}% (LIMIT ORDER on exchange)")
+    print(f"  Stop Loss:        {config.stop_loss_pct}% (monitored internally)")
     print(f"  Entry Window:     {config.entry_time_start} - {config.entry_time_end} EST")
-    print(f"  Force Exit:       {config.force_exit_time} EST")
+    print(f"  Force Exit:       {config.force_exit_time} EST (if no TP/SL hit)")
     print(f"  Strategy:         {config.strategy_file}")
     print(f"  Confirm Trades:   {'Yes' if config.require_confirmation else 'No'}")
+    print()
+    print("  --- Order Management ---")
+    print("  Alpaca only supports MARKET and LIMIT orders for options.")
+    print("  TP: Placed as LIMIT SELL order on Alpaca (auto-fills at target)")
+    print("  SL: Monitored internally (market sell when triggered)")
 
     # Show today's stats if available
     if config.last_trade_date:

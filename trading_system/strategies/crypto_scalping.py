@@ -1,37 +1,48 @@
 """
-Crypto Scalping Strategy V5 - 24/7 Spot Trading on Alpaca
+Crypto Scalping Strategy V10 - 24/7 Spot Trading on Alpaca
 
-An improved buy-low-sell-high scalping strategy with:
-- Candlestick Pattern Recognition (Hammer, Engulfing, Doji)
-- Multi-indicator Momentum Confirmation
-- Support/Resistance Level Detection
-- Trend Filter (only trade with momentum)
-- Optimized Risk/Reward Ratio (3.3:1)
-- Time-of-Day Filter (avoid low-volume hours)
+VERSION 10 ENHANCEMENTS:
+========================
+- NEW: 1H MACRO CONTEXT (Bias Layer, not hard filter)
+  - 50/200 EMA trend direction
+  - Key S/R level detection
+  - ADX regime detection (trending vs ranging)
+  - Provides score bonus/penalty, NOT blocking trades
+
+V9 INDICATORS:
+- M0 (15-min): RSI-14 and ADX-14 for trend strength
+- M1 (1-min): Williams %R and CCI for oversold confirmation
+- M2 (5-min): ATR volatility filter and VWAP distance check
 
 SUPPORTED ASSETS (Alpaca Spot):
-- BTC/USD, ETH/USD, SOL/USD, DOGE/USD, LINK/USD
-- AVAX/USD, DOT/USD, LTC/USD, SHIB/USD
+- BTC/USD, ETH/USD, SOL/USD, DOGE/USD, AVAX/USD
 
-STRATEGY LOGIC V5:
-==================
-Entry Conditions (BUY) - Need 6+ confirmations (RSI mandatory):
-1. RSI < 30 (oversold) - MANDATORY
-2. Price at or below Lower Bollinger Band
-3. Volume spike (current > 1.3x average)
-4. Bullish candlestick pattern (Hammer, Engulfing, or Doji reversal)
-5. MACD histogram turning positive (momentum shift)
-6. Stochastic %K crossing above %D from oversold
-7. Price near recent support level
-8. Price below VWAP
-9. ADX > 20 (trending market)
+SIGNAL HIERARCHY (V10):
+=======================
+MACRO (1H Context Layer) - Provides bias/boost, NOT a blocker:
+  - 50/200 EMA: Trend direction
+  - ADX: Trending vs Ranging regime
+  - S/R: Key levels for context
+
+M0 (15-min Master Trend) - Main trend filter:
+  - EMA20 slope + Price vs EMA
+  - Candle patterns + HH/HL analysis
+  - RSI-14 trend zone + ADX-14 strength
+
+M1 (1-min Technical Entry) - Entry timing:
+  - RSI oversold + MACD + Trend EMA (mandatory)
+  - Bollinger Bands + Volume + Candlesticks
+  - Williams %R + CCI confirmation
+
+M2 (5-min Price Action) - Confirmation:
+  - Candle colors + HH/HL patterns
+  - Momentum + Bar strength
+  - ATR volatility filter + VWAP distance
 
 Exit Conditions (SELL):
-1. Take Profit: +2.0% (3.3:1 ratio)
-2. Stop Loss: -0.6% (tight but gives room)
-3. Trailing Stop after +1.0% profit (locks in gains)
-4. RSI > 75 (only after 15min hold and +0.5% profit)
-5. Upper BB (only after 15min hold and +0.8% profit)
+1. Take Profit: +1.5%
+2. Stop Loss: -1.0%
+3. Trailing Stop after +0.8% profit (locks in gains)
 
 Time Filter: Only trade 00:00-08:00 UTC and 13:00-21:00 UTC
 """
@@ -42,6 +53,7 @@ from decimal import Decimal
 from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
 import pytz
+import uuid
 
 from ..strategy.base import Strategy, StrategyConfig
 from ..strategy.logger import LogColor
@@ -62,14 +74,59 @@ from ..indicators import (
     ADX,
     Stochastic,
 )
-from ..indicators.ml_ensemble import MLEnsembleIndicator
+# ML Ensemble disabled for now due to slow sklearn imports on Windows
+# from ..indicators.ml_ensemble import MLEnsembleIndicator
+MLEnsembleIndicator = None  # Disabled
 
 
-# Supported crypto symbols on Alpaca (removed UNI - delisted/no data)
+# Supported crypto symbols on Alpaca (V6: reduced to 5 best performers)
 ALPACA_CRYPTO_SYMBOLS = [
-    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "LINK/USD",
-    "AVAX/USD", "DOT/USD", "LTC/USD", "SHIB/USD"
+    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD"
 ]
+
+# Per-symbol risk parameters based on volatility characteristics
+# V10.2: Lowered min_entry_score by 1-2 points since we have multi-layer confirmation:
+#   - MACRO(1H) provides bias/boost
+#   - M0(15m) master trend must be UP
+#   - M2(5m) price action must be BULLISH
+# With these extra filters, we can be more lenient on M1 technical score
+SYMBOL_RISK_PARAMS = {
+    "BTC/USD": {
+        "target_profit_pct": 1.2,    # Lower TP - BTC moves slower
+        "stop_loss_pct": 0.8,        # Tighter SL - less noise
+        "trailing_stop_pct": 0.4,
+        "trailing_activation": 0.6,
+        "min_entry_score": 4,        # V10.2: Lowered from 5 - M0+M2 already filtering
+    },
+    "ETH/USD": {
+        "target_profit_pct": 1.3,    # Slightly higher than BTC
+        "stop_loss_pct": 0.9,
+        "trailing_stop_pct": 0.45,
+        "trailing_activation": 0.7,
+        "min_entry_score": 4,        # V10.2: Lowered from 5 - M0+M2 already filtering
+    },
+    "SOL/USD": {
+        "target_profit_pct": 1.5,    # Standard V6 levels
+        "stop_loss_pct": 1.0,
+        "trailing_stop_pct": 0.5,
+        "trailing_activation": 0.8,
+        "min_entry_score": 5,        # V10.2: Lowered from 6 - M0+M2 already filtering
+    },
+    "DOGE/USD": {
+        "target_profit_pct": 2.0,    # Wider TP - DOGE is volatile
+        "stop_loss_pct": 1.2,        # Wider SL - more noise
+        "trailing_stop_pct": 0.6,
+        "trailing_activation": 1.0,
+        "min_entry_score": 5,        # V10.2: Lowered from 7 - MACRO boost helps
+    },
+    "AVAX/USD": {
+        "target_profit_pct": 1.5,    # Same as SOL
+        "stop_loss_pct": 1.0,
+        "trailing_stop_pct": 0.5,
+        "trailing_activation": 0.8,
+        "min_entry_score": 5,        # V10.2: Lowered from 6 - M0+M2 already filtering
+    },
+}
 
 
 # Candlestick Pattern Types
@@ -98,17 +155,17 @@ class CryptoScalpingConfig(StrategyConfig):
     fixed_position_value: float = 500.0
     max_position_value: float = 2000.0
 
-    # Profit/Loss targets - IMPROVED RATIO (3.3:1)
-    target_profit_pct: float = 2.0      # 2.0% take profit (increased from 1.5%)
-    stop_loss_pct: float = 0.6          # 0.6% stop loss (3.3:1 ratio)
-    trailing_stop_pct: float = 0.5      # 0.5% trailing stop (slightly wider)
-    trailing_stop_activation: float = 1.0  # Activate trailing stop after +1.0% profit
+    # Profit/Loss targets - V6: More realistic for crypto volatility
+    target_profit_pct: float = 1.5      # 1.5% take profit
+    stop_loss_pct: float = 1.0          # 1.0% stop loss (1.5:1 ratio)
+    trailing_stop_pct: float = 0.5      # 0.5% trailing stop
+    trailing_stop_activation: float = 0.8  # Activate trailing stop after +0.8% profit
     use_trailing_stop: bool = True
 
     # Indicator parameters
     rsi_period: int = 14
-    rsi_oversold: float = 30.0          # Stricter - only deeply oversold
-    rsi_overbought: float = 75.0        # Higher - let winners run more
+    rsi_oversold: float = 35.0          # V6: Widened from 30 to 35 (less strict)
+    rsi_overbought: float = 70.0        # Lower - exit earlier
     bb_period: int = 20
     bb_std_dev: float = 2.0
     vwap_period: int = 50
@@ -136,7 +193,7 @@ class CryptoScalpingConfig(StrategyConfig):
     max_daily_loss: float = 1500.0      # Stop if losing too much
 
     # Entry quality score
-    min_entry_score: int = 6            # Minimum score to enter (RSI mandatory + 5 more confirmations)
+    min_entry_score: int = 7            # V6: Increased from 6 to 7 (RSI + TREND + MACD + 4 more)
 
     # Minimum holding time (minutes) before technical exits
     min_hold_minutes: int = 15          # Must hold at least 15 minutes before RSI/MACD exits
@@ -148,8 +205,8 @@ class CryptoScalpingConfig(StrategyConfig):
     use_time_filter: bool = True
     allowed_trading_hours: List[int] = field(default_factory=lambda: list(range(0, 9)) + list(range(13, 22)))  # 00-08 UTC and 13-21 UTC
 
-    # ML Ensemble Configuration
-    use_ml_ensemble: bool = True        # Enable ML ensemble indicator
+    # ML Ensemble Configuration (disabled for now - sklearn imports too slow on Windows)
+    use_ml_ensemble: bool = False       # Disabled - sklearn imports hang
     ml_model_path: str = "models/crypto_scalping_ensemble.pkl"  # Path to trained model
     ml_entry_threshold: float = 0.60    # Min ML probability for entry boost
     ml_strong_threshold: float = 0.70   # Min ML probability for strong boost
@@ -161,6 +218,14 @@ class SymbolState:
     def __init__(self, symbol: str, config: CryptoScalpingConfig):
         self.symbol = symbol
         self.config = config
+
+        # Per-symbol risk parameters (use symbol-specific or fall back to config defaults)
+        symbol_params = SYMBOL_RISK_PARAMS.get(symbol, {})
+        self.target_profit_pct = symbol_params.get('target_profit_pct', config.target_profit_pct)
+        self.stop_loss_pct = symbol_params.get('stop_loss_pct', config.stop_loss_pct)
+        self.trailing_stop_pct = symbol_params.get('trailing_stop_pct', config.trailing_stop_pct)
+        self.trailing_stop_activation = symbol_params.get('trailing_activation', config.trailing_stop_activation)
+        self.min_entry_score = symbol_params.get('min_entry_score', config.min_entry_score)
 
         # Core indicators
         self.rsi = RelativeStrengthIndex(config.rsi_period)
@@ -175,23 +240,14 @@ class SymbolState:
         self.macd = MACD(12, 26, 9)
         self.atr = AverageTrueRange(14)
 
-        # ML Ensemble Indicator
-        self.ml_ensemble: Optional[MLEnsembleIndicator] = None
-        if config.use_ml_ensemble:
-            try:
-                self.ml_ensemble = MLEnsembleIndicator(
-                    model_path=config.ml_model_path,
-                    window=50
-                )
-                if self.ml_ensemble.is_available:
-                    print(f"      ✅ ML Ensemble loaded for {symbol}")
-                else:
-                    print(f"      ⚠️ ML Ensemble not available for {symbol} (model not loaded)")
-            except Exception as e:
-                print(f"      ❌ ML Ensemble failed for {symbol}: {e}")
-                import traceback
-                traceback.print_exc()
-                self.ml_ensemble = None
+        # ML Ensemble Indicator (disabled for now)
+        self.ml_ensemble = None
+        # ML loading disabled - sklearn imports too slow on Windows
+        # if config.use_ml_ensemble and MLEnsembleIndicator is not None:
+        #     try:
+        #         self.ml_ensemble = MLEnsembleIndicator(...)
+        #     except Exception as e:
+        #         pass
 
         # Bar history for pattern recognition
         self.bar_history: deque = deque(maxlen=100)
@@ -218,6 +274,17 @@ class SymbolState:
         # Cooldown
         self.last_trade_time: Optional[datetime] = None
         self.consecutive_losses: int = 0
+
+        # V10.5: Multi-timeframe bar storage (populated by engine)
+        # These are set by the engine before calling on_bar
+        self.bars_5min: Optional[list] = None   # For M2 (Price Action)
+        self.bars_15min: Optional[list] = None  # For M0 (Master Trend)
+        self.bars_1h: Optional[list] = None     # For MACRO context
+
+        # V10.5: Cached layer results (to avoid recalculating)
+        self.last_m0_result: Optional[dict] = None
+        self.last_m2_result: Optional[dict] = None
+        self.last_macro_result: Optional[dict] = None
 
     def update_indicators(self, bar: Bar) -> None:
         """Update all indicators with new bar data."""
@@ -252,7 +319,7 @@ class SymbolState:
                 indicators_dict = {
                     'rsi': {'value': self.rsi.value if self.rsi.initialized else 50},
                     'macd': {
-                        'macd': self.macd.macd if self.macd.initialized else 0,
+                        'macd': self.macd.value if self.macd.initialized else 0,
                         'signal': self.macd.signal if self.macd.initialized else 0,
                         'histogram': self.macd.histogram if self.macd.initialized else 0
                     },
@@ -460,6 +527,124 @@ class SymbolState:
             return False
         return self.stoch.k < self.config.stoch_oversold
 
+    def is_trend_up(self, price: float) -> Tuple[bool, str]:
+        """
+        V6: Check if overall trend is UP - CRITICAL to avoid catching falling knives.
+
+        Returns:
+            (is_up, reason): True if trend is favorable for long entry
+        """
+        if not self.trend_ema.initialized:
+            return False, "EMA not initialized"
+
+        # Check 1: Price above 50 EMA (uptrend)
+        price_above_ema = price > self.trend_ema.value
+
+        # Check 2: EMA is rising (compare to 3 bars ago)
+        ema_rising = False
+        if len(self.bar_history) >= 4:
+            # Calculate EMA slope using recent values
+            current_ema = self.trend_ema.value
+            # We need to estimate where EMA was 3 bars ago
+            # Use fast EMA vs slow EMA as proxy for momentum direction
+            if self.fast_ema.initialized and self.slow_ema.initialized:
+                ema_rising = self.fast_ema.value > self.slow_ema.value
+
+        # Check 3: MACD line above signal (momentum turning up)
+        macd_bullish = False
+        if self.macd.initialized:
+            macd_bullish = self.macd.value > self.macd.signal
+
+        # V6: Need at least ONE trend confirmation
+        if price_above_ema:
+            return True, "price > EMA50"
+        if ema_rising:
+            return True, "fast EMA > slow EMA"
+        if macd_bullish:
+            return True, "MACD > signal"
+
+        return False, "downtrend"
+
+    def is_macd_positive(self) -> bool:
+        """V6: Check if MACD histogram is strictly positive (not just improving)."""
+        if not self.macd.initialized:
+            return False
+        return self.macd.histogram > 0
+
+    def check_v10_entry_conditions(self, m1_score: int) -> Tuple[bool, str, dict]:
+        """
+        V10.5: Check ALL V10 signal hierarchy layers for entry.
+
+        This method validates the complete V10 signal stack:
+          - MACRO (1H): Market bias/context - provides score adjustment
+          - M0: Master Trend (15-min) = must be UP
+          - M1: Technical Score (1-min) = adjusted by MACRO, must meet threshold
+          - M2: Price Action (5-min) = must be BULLISH
+
+        Returns:
+            (can_enter, reason, context_dict)
+        """
+        from trading_system.strategies.crypto_scalping import CryptoScalping
+
+        context = {
+            'm0_ready': False,
+            'm1_ready': False,
+            'm2_ready': False,
+            'm0_result': None,
+            'm2_result': None,
+            'macro_result': None,
+            'adjusted_score': m1_score,
+        }
+
+        # ===== CHECK MACRO (1H) - Provides score adjustment =====
+        if self.bars_1h and len(self.bars_1h) >= 20:
+            macro_result = CryptoScalping.calculate_macro_context(self.bars_1h)
+            context['macro_result'] = macro_result
+            self.last_macro_result = macro_result
+
+            score_adjustment = macro_result.get('score_adjustment', 0)
+            adjusted_score = m1_score + score_adjustment
+            context['adjusted_score'] = adjusted_score
+        else:
+            # No macro data - use base score
+            adjusted_score = m1_score
+            context['adjusted_score'] = adjusted_score
+
+        # ===== CHECK M0: Master Trend (15-min) - MUST BE UP =====
+        if self.bars_15min and len(self.bars_15min) >= 25:
+            m0_result = CryptoScalping.calculate_master_trend_signal(self.bars_15min)
+            context['m0_result'] = m0_result
+            self.last_m0_result = m0_result
+
+            if m0_result['trend'] == 'UP':
+                context['m0_ready'] = True
+            else:
+                return False, f"M0 not UP ({m0_result['trend']})", context
+        else:
+            return False, "No 15-min bars for M0", context
+
+        # ===== CHECK M1: Technical Score (adjusted) - MUST MEET THRESHOLD =====
+        if adjusted_score >= self.min_entry_score:
+            context['m1_ready'] = True
+        else:
+            return False, f"M1 score {adjusted_score} < {self.min_entry_score}", context
+
+        # ===== CHECK M2: Price Action (5-min) - MUST BE BULLISH =====
+        if self.bars_5min and len(self.bars_5min) >= 10:
+            m2_result = CryptoScalping.calculate_price_action_signal(self.bars_5min)
+            context['m2_result'] = m2_result
+            self.last_m2_result = m2_result
+
+            if m2_result['signal'] == 'BULLISH':
+                context['m2_ready'] = True
+            else:
+                return False, f"M2 not BULLISH ({m2_result['signal']})", context
+        else:
+            return False, "No 5-min bars for M2", context
+
+        # ALL LAYERS ALIGNED!
+        return True, "All V10 layers aligned", context
+
 
 class CryptoScalping(Strategy):
     """
@@ -474,14 +659,16 @@ class CryptoScalping(Strategy):
         self.config: CryptoScalpingConfig = config
 
         self.log.info("=" * 80, LogColor.BLUE)
-        self.log.info("INITIALIZING CRYPTO SCALPING STRATEGY V5", LogColor.BLUE)
+        self.log.info("INITIALIZING CRYPTO SCALPING STRATEGY V6", LogColor.BLUE)
+        self.log.info("   V6 FIX: Mandatory TREND FILTER to avoid catching falling knives", LogColor.BLUE)
         self.log.info("=" * 80, LogColor.BLUE)
 
-        # Initialize state for each symbol
+        # Initialize state for each symbol with per-symbol risk params
         self.symbol_states: Dict[str, SymbolState] = {}
         for symbol in config.symbols:
-            self.symbol_states[symbol] = SymbolState(symbol, config)
-            self.log.info(f"   Tracking: {symbol}", LogColor.CYAN)
+            state = SymbolState(symbol, config)
+            self.symbol_states[symbol] = state
+            self.log.info(f"   {symbol}: TP={state.target_profit_pct}% SL={state.stop_loss_pct}% MinScore={state.min_entry_score}", LogColor.CYAN)
 
         # Daily tracking
         self.trades_today = 0
@@ -499,12 +686,12 @@ class CryptoScalping(Strategy):
         self.log.info(f"   TP/SL: +{config.target_profit_pct}% / -{config.stop_loss_pct}% (Ratio: {config.target_profit_pct/config.stop_loss_pct:.1f}:1)", LogColor.CYAN)
         self.log.info(f"   Min Entry Score: {config.min_entry_score} confirmations", LogColor.CYAN)
         self.log.info(f"   Time Filter: {config.use_time_filter} (Hours: 00-08 UTC, 13-21 UTC)", LogColor.CYAN)
-        self.log.info("Strategy V5 initialization complete", LogColor.GREEN)
+        self.log.info("Strategy V10.5 initialization complete - V10 layers in STRATEGY", LogColor.GREEN)
 
     def on_start(self) -> None:
         """Strategy startup."""
         self.log.info("=" * 80, LogColor.GREEN)
-        self.log.info("STARTING CRYPTO SCALPING STRATEGY V5", LogColor.GREEN)
+        self.log.info("STARTING CRYPTO SCALPING STRATEGY V10", LogColor.GREEN)
         self.log.info("=" * 80, LogColor.GREEN)
         self.log.info("Strategy Parameters:", LogColor.CYAN)
         self.log.info(f"   RSI: {self.config.rsi_period} (oversold={self.config.rsi_oversold})", LogColor.CYAN)
@@ -555,12 +742,33 @@ class CryptoScalping(Strategy):
             if not self._can_trade(state, bar_time_utc):
                 return
 
-            # Calculate entry score and check conditions
+            # Calculate M1 entry score (1-min technical indicators)
             entry_score, pattern, signals = self._calculate_entry_score(state, bar)
 
-            if entry_score >= self.config.min_entry_score:
-                state.entry_score = entry_score
+            # V10.5: Check ALL V10 layers before entry
+            # The strategy validates M0, M1 (adjusted by MACRO), and M2
+            can_enter, reason, v10_context = state.check_v10_entry_conditions(entry_score)
+
+            if can_enter:
+                # Use adjusted score (includes MACRO boost)
+                adjusted_score = v10_context.get('adjusted_score', entry_score)
+                state.entry_score = adjusted_score
                 state.entry_pattern = pattern
+
+                # Log V10 layer alignment
+                self.log.info("=" * 60, LogColor.GREEN)
+                self.log.info(f"V10.5 ALL LAYERS ALIGNED: {symbol}", LogColor.GREEN)
+                m0 = v10_context.get('m0_result', {})
+                m2 = v10_context.get('m2_result', {})
+                macro = v10_context.get('macro_result', {})
+                if macro:
+                    self.log.info(f"   MACRO (1H): {macro.get('bias', 'N/A')} | Adj: {macro.get('score_adjustment', 0):+d}", LogColor.CYAN)
+                if m0:
+                    self.log.info(f"   M0 (15m): {m0.get('trend', 'N/A')} ({m0.get('strength', 'N/A')})", LogColor.CYAN)
+                self.log.info(f"   M1 (1m): {adjusted_score}/{state.min_entry_score} (base: {entry_score})", LogColor.CYAN)
+                if m2:
+                    self.log.info(f"   M2 (5m): {m2.get('signal', 'N/A')} ({m2.get('strength', 'N/A')})", LogColor.CYAN)
+
                 self._enter_position(state, bar, bar_time_utc, signals)
 
         except Exception as e:
@@ -629,12 +837,85 @@ class CryptoScalping(Strategy):
 
         return True
 
+    def _calculate_williams_r(self, state: SymbolState) -> float:
+        """
+        V9: Calculate Williams %R indicator.
+
+        Williams %R = ((Highest High - Close) / (Highest High - Lowest Low)) * -100
+
+        Range: 0 to -100
+        - Above -20: Overbought
+        - Below -80: Oversold
+
+        Uses the price history from the state's bar history.
+        """
+        if len(state.bar_history) < 14:
+            return -50.0  # Neutral if not enough data
+
+        # Get last 14 bars for calculation
+        recent_bars = list(state.bar_history)[-14:]
+        highs = [b.high for b in recent_bars]
+        lows = [b.low for b in recent_bars]
+        current_close = recent_bars[-1].close
+
+        highest_high = max(highs)
+        lowest_low = min(lows)
+
+        if highest_high == lowest_low:
+            return -50.0  # Avoid division by zero
+
+        williams_r = ((highest_high - current_close) / (highest_high - lowest_low)) * -100
+        return williams_r
+
+    def _calculate_cci(self, state: SymbolState) -> float:
+        """
+        V9: Calculate Commodity Channel Index (CCI).
+
+        CCI = (Typical Price - SMA of TP) / (0.015 * Mean Deviation)
+        where Typical Price = (High + Low + Close) / 3
+
+        Interpretation:
+        - CCI > 100: Overbought
+        - CCI < -100: Oversold
+
+        Uses 20-period calculation.
+        """
+        period = 20
+        if len(state.bar_history) < period:
+            return 0.0  # Neutral if not enough data
+
+        recent_bars = list(state.bar_history)[-period:]
+
+        # Calculate Typical Prices
+        typical_prices = [(b.high + b.low + b.close) / 3 for b in recent_bars]
+
+        # SMA of Typical Prices
+        sma_tp = sum(typical_prices) / period
+
+        # Mean Deviation
+        mean_deviation = sum(abs(tp - sma_tp) for tp in typical_prices) / period
+
+        if mean_deviation == 0:
+            return 0.0  # Avoid division by zero
+
+        current_tp = typical_prices[-1]
+        cci = (current_tp - sma_tp) / (0.015 * mean_deviation)
+        return cci
+
     def _calculate_entry_score(self, state: SymbolState, bar: Bar) -> Tuple[int, str, Dict[str, bool]]:
         """
-        Calculate entry quality score based on multiple confirmations.
+        V10.3: Calculate entry quality score - NO mandatory blockers.
+
+        V10 already provides multi-layer filtering:
+        - M0 (15-min): Master trend must be UP
+        - M2 (5-min): Price action must be BULLISH
+        - MACRO (1H): Provides score adjustment
+
+        So the M1 (1-min) layer just needs to calculate a SCORE, not block.
+        The engine will check M0+M2 before entering.
 
         Returns:
-            score: Number of confirmations (0 if RSI not oversold, 1-8 otherwise)
+            score: Number of confirmations (no blockers, just points)
             pattern: Detected candlestick pattern
             signals: Dict of which signals are active
         """
@@ -642,40 +923,58 @@ class CryptoScalping(Strategy):
         score = 0
         signals = {}
 
-        # 1. RSI Oversold (MANDATORY - must be oversold to consider entry)
+        # Initialize all signals to False
+        signals['rsi_oversold'] = False
+        signals['trend_up'] = False
+        signals['trend_reason'] = "not checked"
+        signals['macd_histogram_positive'] = False
+        signals['below_bb'] = False
+        signals['volume_spike'] = False
+        signals['pattern'] = CandlePattern.NONE
+        signals['stoch_oversold'] = False
+        signals['near_support'] = False
+        signals['below_vwap'] = False
+        signals['adx_trending'] = False
+
+        # ===== V10.3: RSI Score (not mandatory, just points) =====
         rsi_oversold = state.rsi.value < self.config.rsi_oversold
         signals['rsi_oversold'] = rsi_oversold
 
-        # If RSI is NOT oversold, return 0 score immediately (no entry allowed)
-        if not rsi_oversold:
-            signals['below_bb'] = False
-            signals['volume_spike'] = False
-            signals['pattern'] = CandlePattern.NONE
-            signals['macd_positive'] = False
-            signals['stoch_oversold'] = False
-            signals['near_support'] = False
-            signals['below_vwap'] = False
-            signals['adx_trending'] = False
-            return 0, CandlePattern.NONE, signals
+        if rsi_oversold:
+            score += 2  # 2 points for RSI oversold
+            if state.rsi.value < 25:  # Extra point for deeply oversold
+                score += 1
 
-        # RSI is oversold - start counting confirmations
-        score += 1
-        if state.rsi.value < 25:  # Extra point for deeply oversold
-            score += 1
+        # ===== V10.3: TREND Score (not mandatory - M0 checks this) =====
+        trend_up, trend_reason = state.is_trend_up(price)
+        signals['trend_up'] = trend_up
+        signals['trend_reason'] = trend_reason
 
-        # 2. Price at/below Lower BB - 1 point (strong oversold confirmation)
+        if trend_up:
+            score += 2  # 2 points for trend up (bonus, M0 already checks)
+
+        # ===== V10.3: MACD Score (not mandatory, just points) =====
+        macd_positive = state.is_macd_positive()
+        signals['macd_histogram_positive'] = macd_positive
+
+        if macd_positive:
+            score += 2  # 2 points for MACD positive
+
+        # ===== OPTIONAL CONFIRMATIONS (add more points) =====
+
+        # 4. Price at/below Lower BB - 1 point (oversold bounce setup)
         bb_signal = price <= state.bb.lower
         signals['below_bb'] = bb_signal
         if bb_signal:
             score += 1
 
-        # 3. Volume spike - 1 point (capitulation/interest)
+        # 5. Volume spike - 1 point (capitulation/interest)
         volume_spike = state.volume_ma.is_spike(self.config.volume_spike_multiplier)
         signals['volume_spike'] = volume_spike
         if volume_spike:
             score += 1
 
-        # 4. Bullish candlestick pattern - 1-2 points (reversal confirmation)
+        # 6. Bullish candlestick pattern - 1-2 points (reversal confirmation)
         pattern = state.detect_candlestick_pattern()
         signals['pattern'] = pattern
         if pattern != CandlePattern.NONE:
@@ -683,62 +982,80 @@ class CryptoScalping(Strategy):
             if pattern in [CandlePattern.BULLISH_ENGULFING, CandlePattern.MORNING_STAR]:
                 score += 1  # Extra point for strong patterns
 
-        # 5. MACD momentum positive or improving - 1 point
-        macd_positive = state.is_macd_momentum_positive()
-        signals['macd_positive'] = macd_positive
-        if macd_positive:
-            score += 1
-
-        # 6. Stochastic oversold or bullish crossover - 1 point
+        # 7. Stochastic oversold or bullish crossover - 1 point
         stoch_signal = state.is_stoch_oversold() or state.is_stoch_bullish_crossover()
         signals['stoch_oversold'] = stoch_signal
         if stoch_signal:
             score += 1
 
-        # 7. Near support level - 1 point
+        # 8. Near support level - 1 point
         near_support = state.is_near_support(price)
         signals['near_support'] = near_support
         if near_support:
             score += 1
 
-        # 8. Price below VWAP - 1 point (discount to average)
+        # 9. Price below VWAP - 1 point (discount to average)
         below_vwap = state.vwap.is_price_below(price)
         signals['below_vwap'] = below_vwap
         if below_vwap:
             score += 1
 
-        # 9. ADX trending - 1 point (confirms momentum exists)
+        # 10. ADX trending - 1 point (only if trend is up!)
+        # V6: Only add ADX point if we're in an uptrend (already confirmed)
         adx_trending = state.adx.is_trending(self.config.adx_trend_threshold)
         signals['adx_trending'] = adx_trending
         if adx_trending:
             score += 1
 
-        # 10. ML Ensemble Prediction - 0 to 2 bonus points (HYBRID BOOST)
+        # ===== V9: ADDITIONAL OVERSOLD CONFIRMATIONS =====
+
+        # 11. V9: Williams %R - 1 point (oversold confirmation)
+        # Williams %R < -80 = oversold (0 to -100 scale)
+        williams_r = self._calculate_williams_r(state)
+        signals['williams_r'] = williams_r
+        signals['williams_oversold'] = williams_r < -80
+
+        if williams_r < -80:
+            score += 1
+            if williams_r < -90:  # Extra deeply oversold
+                score += 0.5
+
+        # 12. V9: CCI (Commodity Channel Index) - 1 point
+        # CCI < -100 = oversold (momentum divergence)
+        cci = self._calculate_cci(state)
+        signals['cci'] = cci
+        signals['cci_oversold'] = cci < -100
+
+        if cci < -100:
+            score += 1
+            if cci < -150:  # Extra point for extreme oversold
+                score += 0.5
+
+        # 13. ML Ensemble Prediction - 0 to 2 bonus points
         ml_score = 0
         ml_probability = 0.5
         ml_signal = "UNAVAILABLE"
         ml_confidence = "N/A"
-        
+
         if state.ml_ensemble is not None and state.ml_ensemble.is_available:
             try:
                 ml_probability = state.ml_ensemble.value
                 ml_signal = state.ml_ensemble.signal
                 ml_confidence = state.ml_ensemble.confidence
-                
-                # Add ML score based on probability
+
                 if ml_probability >= self.config.ml_strong_threshold:
-                    ml_score = 2  # Very strong ML confirmation
+                    ml_score = 2
                 elif ml_probability >= self.config.ml_entry_threshold:
-                    ml_score = 1  # Moderate ML confirmation
+                    ml_score = 1
                 elif ml_probability >= 0.50:
-                    ml_score = 0.5  # Weak ML confirmation
+                    ml_score = 0.5
                 elif ml_probability < 0.45:
-                    ml_score = -1  # ML says NO - reduce score
-                
+                    ml_score = -1  # ML says NO
+
                 score += ml_score
             except:
                 pass
-        
+
         signals['ml_probability'] = ml_probability
         signals['ml_signal'] = ml_signal
         signals['ml_confidence'] = ml_confidence
@@ -747,24 +1064,31 @@ class CryptoScalping(Strategy):
         return score, pattern, signals
 
     def _enter_position(self, state: SymbolState, bar: Bar, bar_time: datetime, signals: Dict[str, bool]) -> None:
-        """Enter a long position with detailed logging."""
+        """
+        Signal an entry for a long position.
+
+        V7: When paper_trading_mode is True, this method only sets the
+        pending_entry_order_id flag. The CryptoPaperTradingEngine will then
+        check dual signal confirmation before actually placing the order.
+        """
         symbol = state.symbol
         price = bar.close
 
         self.log.info("=" * 60, LogColor.GREEN)
-        self.log.info(f"ENTRY SIGNAL: {symbol} (Score: {state.entry_score})", LogColor.GREEN)
+        self.log.info(f"ENTRY SIGNAL (METHOD 1 - Technical): {symbol} (Score: {state.entry_score})", LogColor.GREEN)
         self.log.info("=" * 60, LogColor.GREEN)
 
-        # Log all signal details
+        # Log all signal details - V6 with mandatory trend filter
         self.log.info(f"   Price: ${price:.4f}", LogColor.CYAN)
         self.log.info(f"   Pattern: {state.entry_pattern}", LogColor.CYAN)
-        self.log.info(f"   RSI: {state.rsi.value:.1f} {'[X]' if signals.get('rsi_oversold') else '[ ]'}", LogColor.CYAN)
+        self.log.info(f"   RSI: {state.rsi.value:.1f} {'[X]' if signals.get('rsi_oversold') else '[ ]'} (MANDATORY)", LogColor.CYAN)
+        self.log.info(f"   TREND: {signals.get('trend_reason', 'N/A')} {'[X]' if signals.get('trend_up') else '[ ]'} (MANDATORY V6)", LogColor.GREEN)
+        self.log.info(f"   MACD Hist: {state.macd.histogram:.4f} {'[X]' if signals.get('macd_histogram_positive') else '[ ]'} (MANDATORY V6)", LogColor.GREEN)
         self.log.info(f"   BB Lower: ${state.bb.lower:.4f} {'[X]' if signals.get('below_bb') else '[ ]'}", LogColor.CYAN)
         self.log.info(f"   Volume: {state.volume_ma.volume_ratio:.1f}x {'[X]' if signals.get('volume_spike') else '[ ]'}", LogColor.CYAN)
-        self.log.info(f"   MACD: {state.macd.histogram:.4f} {'[X]' if signals.get('macd_positive') else '[ ]'}", LogColor.CYAN)
         self.log.info(f"   Stoch K/D: {state.stoch.k:.1f}/{state.stoch.d:.1f} {'[X]' if signals.get('stoch_oversold') else '[ ]'}", LogColor.CYAN)
         self.log.info(f"   Support: {'[X]' if signals.get('near_support') else '[ ]'}", LogColor.CYAN)
-        
+
         # Log ML ensemble signal if available
         if signals.get('ml_score', 0) != 0:
             ml_prob = signals.get('ml_probability', 0.5)
@@ -779,26 +1103,18 @@ class CryptoScalping(Strategy):
         self.log.info(f"   Quantity: {quantity:.6f}", LogColor.CYAN)
         self.log.info(f"   Value: ${self.config.fixed_position_value:.2f}", LogColor.CYAN)
 
-        # Create and submit entry order
-        entry_order = self.order_factory.market(
-            instrument_id=symbol,
-            order_side=OrderSide.BUY,
-            quantity=quantity,
-            time_in_force=TimeInForce.GTC,
-        )
-
-        self.submit_order(entry_order)
-
-        # Track state
-        state.pending_entry_order_id = entry_order.client_order_id
+        # V7: Set flag for paper trading engine to pick up
+        # The engine will check METHOD 2 (Price Action 5-min) before placing order
+        # Use a unique ID based on timestamp
+        state.pending_entry_order_id = f"SIGNAL_{symbol}_{uuid.uuid4().hex[:8]}"
         state.last_trade_time = bar_time
         self.trades_today += 1
 
-        self.log.info(f"   Order ID: {entry_order.client_order_id}", LogColor.GREEN)
-        self.log.info("ENTRY ORDER SUBMITTED", LogColor.GREEN)
+        self.log.info(f"   Signal ID: {state.pending_entry_order_id}", LogColor.GREEN)
+        self.log.info(">>> METHOD 1 PASSED - Waiting for METHOD 2 (Price Action) confirmation...", LogColor.YELLOW)
 
     def _manage_position(self, state: SymbolState, bar: Bar, bar_time: datetime) -> None:
-        """Manage an open position - check exit conditions."""
+        """Manage an open position - check exit conditions using per-symbol risk params."""
         if state.position is None or state.entry_price is None:
             return
 
@@ -813,19 +1129,25 @@ class CryptoScalping(Strategy):
         if state.entry_time is not None:
             hold_minutes = (bar_time - state.entry_time).total_seconds() / 60
 
+        # Use per-symbol risk parameters
+        tp_pct = state.target_profit_pct
+        sl_pct = state.stop_loss_pct
+        ts_pct = state.trailing_stop_pct
+        ts_activation = state.trailing_stop_activation
+
         # Check exit conditions in priority order
 
         # 1. STOP LOSS - Always check first (no hold time requirement)
-        if pnl_pct <= -self.config.stop_loss_pct:
-            self.log.info(f"SL HIT: {state.symbol} {pnl_pct:.2f}%", LogColor.RED)
+        if pnl_pct <= -sl_pct:
+            self.log.info(f"SL HIT: {state.symbol} {pnl_pct:.2f}% (SL={sl_pct}%)", LogColor.RED)
             self._close_position(state, bar, "Stop Loss")
             state.consecutive_losses += 1
             self.losses_today += 1
             return
 
         # 2. TAKE PROFIT (no hold time requirement)
-        if pnl_pct >= self.config.target_profit_pct:
-            self.log.info(f"TP HIT: {state.symbol} +{pnl_pct:.2f}%", LogColor.GREEN)
+        if pnl_pct >= tp_pct:
+            self.log.info(f"TP HIT: {state.symbol} +{pnl_pct:.2f}% (TP={tp_pct}%)", LogColor.GREEN)
             self._close_position(state, bar, "Take Profit")
             state.consecutive_losses = 0
             self.wins_today += 1
@@ -836,10 +1158,10 @@ class CryptoScalping(Strategy):
             current_profit = ((state.highest_price_since_entry - entry_price) / entry_price) * 100
 
             # Only activate trailing stop after reaching activation threshold
-            if current_profit >= self.config.trailing_stop_activation:
-                trailing_stop_price = state.highest_price_since_entry * (1 - self.config.trailing_stop_pct / 100)
+            if current_profit >= ts_activation:
+                trailing_stop_price = state.highest_price_since_entry * (1 - ts_pct / 100)
                 if price <= trailing_stop_price:
-                    self.log.info(f"TRAILING STOP: {state.symbol} +{pnl_pct:.2f}%", LogColor.YELLOW)
+                    self.log.info(f"TRAILING STOP: {state.symbol} +{pnl_pct:.2f}% (TS={ts_pct}%)", LogColor.YELLOW)
                     self._close_position(state, bar, "Trailing Stop")
                     if pnl_pct > 0:
                         state.consecutive_losses = 0
@@ -849,41 +1171,9 @@ class CryptoScalping(Strategy):
                         self.losses_today += 1
                     return
 
-        # === TECHNICAL EXITS - REQUIRE MINIMUM HOLD TIME AND PROFIT ===
-        # Don't allow technical exits too early or with insufficient profit
-        can_technical_exit = (
-            hold_minutes >= self.config.min_hold_minutes and
-            pnl_pct >= self.config.min_profit_for_technical_exit
-        )
-
-        if not can_technical_exit:
-            return  # Only SL/TP/Trailing can exit early
-
-        # 4. RSI OVERBOUGHT (requires min hold time and min profit)
-        if state.rsi.value >= self.config.rsi_overbought:
-            self.log.info(f"RSI OVERBOUGHT: {state.symbol} RSI={state.rsi.value:.1f} +{pnl_pct:.2f}% (held {hold_minutes:.0f}m)", LogColor.YELLOW)
-            self._close_position(state, bar, "RSI Overbought")
-            state.consecutive_losses = 0
-            self.wins_today += 1
-            return
-
-        # 5. MACD MOMENTUM REVERSAL (requires min hold and profit)
-        if pnl_pct > 0.5 and state.macd_hist_prev is not None:
-            # Exit if MACD histogram turns negative from positive
-            if state.macd_hist_prev > 0 and state.macd.histogram < 0:
-                self.log.info(f"MACD REVERSAL: {state.symbol} +{pnl_pct:.2f}% (held {hold_minutes:.0f}m)", LogColor.YELLOW)
-                self._close_position(state, bar, "MACD Reversal")
-                state.consecutive_losses = 0
-                self.wins_today += 1
-                return
-
-        # 6. UPPER BB (requires min hold and good profit)
-        if pnl_pct >= 0.8 and price >= state.bb.upper:
-            self.log.info(f"UPPER BB: {state.symbol} +{pnl_pct:.2f}% (held {hold_minutes:.0f}m)", LogColor.YELLOW)
-            self._close_position(state, bar, "Upper BB")
-            state.consecutive_losses = 0
-            self.wins_today += 1
-            return
+        # TECHNICAL EXITS DISABLED - Let trades develop to SL/TP
+        # Only SL, TP, and Trailing Stop exits are active
+        # RSI Overbought, MACD Reversal, and Upper BB exits removed
 
     def _close_position(self, state: SymbolState, bar: Bar, reason: str) -> None:
         """Close a position."""
@@ -945,12 +1235,15 @@ class CryptoScalping(Strategy):
                 self.log.info(f"   Qty: {fill_qty:.6f}", LogColor.GREEN)
                 self.log.info(f"   Score: {state.entry_score} | Pattern: {state.entry_pattern}", LogColor.GREEN)
 
-                # Calculate TP/SL prices
-                tp_price = fill_price * (1 + self.config.target_profit_pct / 100)
-                sl_price = fill_price * (1 - self.config.stop_loss_pct / 100)
+                # Calculate TP/SL prices using per-symbol parameters
+                tp_pct = state.target_profit_pct
+                sl_pct = state.stop_loss_pct
+                tp_price = fill_price * (1 + tp_pct / 100)
+                sl_price = fill_price * (1 - sl_pct / 100)
 
-                self.log.info(f"   Take Profit: ${tp_price:.4f} (+{self.config.target_profit_pct}%)", LogColor.BLUE)
-                self.log.info(f"   Stop Loss: ${sl_price:.4f} (-{self.config.stop_loss_pct}%)", LogColor.BLUE)
+                self.log.info(f"   Take Profit: ${tp_price:.4f} (+{tp_pct}%)", LogColor.BLUE)
+                self.log.info(f"   Stop Loss: ${sl_price:.4f} (-{sl_pct}%)", LogColor.BLUE)
+                self.log.info(f"   Risk/Reward: {tp_pct/sl_pct:.1f}:1", LogColor.BLUE)
 
                 state.pending_entry_order_id = None
 
@@ -974,7 +1267,7 @@ class CryptoScalping(Strategy):
 
     def on_stop(self) -> None:
         """Strategy shutdown."""
-        self.log.info("STOPPING CRYPTO SCALPING STRATEGY V2", LogColor.YELLOW)
+        self.log.info("STOPPING CRYPTO SCALPING STRATEGY V6", LogColor.YELLOW)
 
         # Close all open positions
         for symbol, state in self.symbol_states.items():
@@ -990,7 +1283,7 @@ class CryptoScalping(Strategy):
         self.log.info(f"   Wins: {self.wins_today} | Losses: {self.losses_today}", LogColor.CYAN)
         self.log.info(f"   Win Rate: {win_rate:.1f}%", LogColor.CYAN)
         self.log.info(f"   Daily P&L: ${self.daily_pnl:.2f}", LogColor.CYAN)
-        self.log.info("STRATEGY V2 STOPPED", LogColor.YELLOW)
+        self.log.info("STRATEGY V6 STOPPED", LogColor.YELLOW)
 
     def on_reset(self) -> None:
         """Reset strategy state."""
@@ -1017,3 +1310,746 @@ class CryptoScalping(Strategy):
         self.daily_pnl = 0.0
         self.last_trade_date = None
         self.daily_trading_stopped = False
+
+    # ========================================================================
+    # DUAL SIGNAL VALIDATION - Price Action Analysis (5-MIN BARS)
+    # ========================================================================
+
+    @staticmethod
+    def calculate_price_action_signal(bars: list) -> dict:
+        """
+        Calculate trading signal based on PRICE ACTION patterns.
+
+        This is METHOD 2 for dual-confirmation signal validation.
+        It analyzes recent candle patterns independent of technical indicators.
+        Uses 5-MINUTE bars for better noise filtering on crypto.
+
+        Parameters
+        ----------
+        bars : list
+            List of bar objects with: open, close, high, low attributes
+
+        Returns
+        -------
+        dict
+            {
+                'signal': 'BULLISH' | 'BEARISH' | 'NEUTRAL',
+                'strength': str,  # 'STRONG' | 'MODERATE' | 'WEAK'
+                'bullish_points': int,
+                'bearish_points': int,
+                'reasons': list
+            }
+        """
+        if not bars or len(bars) < 10:
+            return {
+                'signal': 'NEUTRAL',
+                'strength': 'WEAK',
+                'bullish_points': 0,
+                'bearish_points': 0,
+                'reasons': ['Not enough bars for price action analysis']
+            }
+
+        # Use last 10 bars for price action analysis
+        recent_bars = bars[-10:]
+        closes = [b.close for b in recent_bars]
+        opens = [b.open for b in recent_bars]
+        highs = [b.high for b in recent_bars]
+        lows = [b.low for b in recent_bars]
+
+        bullish_points = 0
+        bearish_points = 0
+        reasons = []
+
+        # ========== 1. CANDLE COLOR COUNT (last 5 bars) ==========
+        last_5 = recent_bars[-5:]
+        green_candles = sum(1 for b in last_5 if b.close > b.open)
+        red_candles = 5 - green_candles
+
+        if green_candles >= 4:
+            bullish_points += 3
+            reasons.append(f"{green_candles}/5 bars bullish (green)")
+        elif green_candles >= 3:
+            bullish_points += 2
+            reasons.append(f"{green_candles}/5 bars bullish")
+        elif red_candles >= 4:
+            bearish_points += 3
+            reasons.append(f"{red_candles}/5 bars bearish (red)")
+        elif red_candles >= 3:
+            bearish_points += 2
+            reasons.append(f"{red_candles}/5 bars bearish")
+
+        # ========== 2. HIGHER HIGHS / LOWER LOWS (last 5 bars) ==========
+        higher_highs = sum(1 for i in range(1, 5) if highs[-i] > highs[-i-1])
+        lower_lows = sum(1 for i in range(1, 5) if lows[-i] < lows[-i-1])
+        higher_lows = sum(1 for i in range(1, 5) if lows[-i] > lows[-i-1])
+        lower_highs = sum(1 for i in range(1, 5) if highs[-i] < highs[-i-1])
+
+        # Bullish: Higher highs AND higher lows (uptrend)
+        if higher_highs >= 3 and higher_lows >= 2:
+            bullish_points += 3
+            reasons.append(f"Uptrend: {higher_highs} higher highs, {higher_lows} higher lows")
+        elif higher_highs >= 2:
+            bullish_points += 2
+            reasons.append(f"Higher highs pattern ({higher_highs}/4)")
+
+        # Bearish: Lower lows AND lower highs (downtrend)
+        if lower_lows >= 3 and lower_highs >= 2:
+            bearish_points += 3
+            reasons.append(f"Downtrend: {lower_lows} lower lows, {lower_highs} lower highs")
+        elif lower_lows >= 2:
+            bearish_points += 2
+            reasons.append(f"Lower lows pattern ({lower_lows}/4)")
+
+        # ========== 3. PRICE vs 5-BAR AVERAGE ==========
+        avg_5 = sum(closes[-5:]) / 5
+        current_price = closes[-1]
+        price_vs_avg = ((current_price - avg_5) / avg_5) * 100
+
+        if price_vs_avg > 0.1:
+            bullish_points += 2
+            reasons.append(f"Price above 5-bar avg (+{price_vs_avg:.2f}%)")
+        elif price_vs_avg < -0.1:
+            bearish_points += 2
+            reasons.append(f"Price below 5-bar avg ({price_vs_avg:.2f}%)")
+
+        # ========== 4. MOMENTUM (5-bar change) ==========
+        momentum_5 = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 else 0
+
+        if momentum_5 > 0.3:  # Higher threshold for crypto (more volatile)
+            bullish_points += 2
+            reasons.append(f"Strong 5-bar momentum (+{momentum_5:.2f}%)")
+        elif momentum_5 > 0.1:
+            bullish_points += 1
+            reasons.append(f"Positive momentum (+{momentum_5:.2f}%)")
+        elif momentum_5 < -0.3:
+            bearish_points += 2
+            reasons.append(f"Strong bearish momentum ({momentum_5:.2f}%)")
+        elif momentum_5 < -0.1:
+            bearish_points += 1
+            reasons.append(f"Negative momentum ({momentum_5:.2f}%)")
+
+        # ========== 5. LAST BAR ANALYSIS ==========
+        last_bar = recent_bars[-1]
+        bar_range = last_bar.high - last_bar.low
+        bar_body = abs(last_bar.close - last_bar.open)
+        body_ratio = bar_body / bar_range if bar_range > 0 else 0
+
+        # Strong bullish bar: closes near high with good body
+        if last_bar.close > last_bar.open and body_ratio > 0.6:
+            upper_wick = last_bar.high - last_bar.close
+            if upper_wick < bar_body * 0.3:  # Small upper wick
+                bullish_points += 2
+                reasons.append("Strong bullish last bar (closes near high)")
+
+        # Strong bearish bar: closes near low with good body
+        if last_bar.close < last_bar.open and body_ratio > 0.6:
+            lower_wick = last_bar.close - last_bar.low
+            if lower_wick < bar_body * 0.3:  # Small lower wick
+                bearish_points += 2
+                reasons.append("Strong bearish last bar (closes near low)")
+
+        # ========== 6. V9: ATR VOLATILITY FILTER ==========
+        # Calculate ATR to assess volatility
+        # High ATR = good trading conditions (volatility)
+        # Very low ATR = skip (no movement expected)
+        true_ranges = []
+        for i in range(1, len(recent_bars)):
+            bar = recent_bars[i]
+            prev_close = recent_bars[i-1].close
+            tr1 = bar.high - bar.low
+            tr2 = abs(bar.high - prev_close)
+            tr3 = abs(bar.low - prev_close)
+            true_ranges.append(max(tr1, tr2, tr3))
+
+        if true_ranges:
+            atr = sum(true_ranges) / len(true_ranges)
+            atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
+
+            if atr_pct > 0.2:  # Good volatility (>0.2% per bar)
+                bullish_points += 1  # Boost signal confidence
+                reasons.append(f"Good volatility (ATR: {atr_pct:.3f}%)")
+            elif atr_pct < 0.05:  # Very low volatility
+                # Penalize both sides - signal is less reliable
+                bullish_points -= 1 if bullish_points > 0 else 0
+                bearish_points -= 1 if bearish_points > 0 else 0
+                reasons.append(f"Low volatility warning (ATR: {atr_pct:.3f}%)")
+
+        # ========== 7. V9: VWAP DISTANCE (Volume-Weighted Average Price) ==========
+        # Calculate VWAP from available bars
+        # Price far below VWAP = oversold bounce opportunity
+        # Price far above VWAP = potential mean reversion down
+        volumes = [getattr(b, 'volume', 1) for b in recent_bars]
+        total_volume = sum(volumes)
+
+        if total_volume > 0:
+            typical_prices = [(b.high + b.low + b.close) / 3 for b in recent_bars]
+            vwap = sum(tp * v for tp, v in zip(typical_prices, volumes)) / total_volume
+            vwap_distance_pct = ((current_price - vwap) / vwap) * 100 if vwap > 0 else 0
+
+            if vwap_distance_pct < -0.3:  # Price significantly below VWAP
+                bullish_points += 2
+                reasons.append(f"Oversold vs VWAP ({vwap_distance_pct:.2f}%)")
+            elif vwap_distance_pct < -0.1:
+                bullish_points += 1
+                reasons.append(f"Below VWAP ({vwap_distance_pct:.2f}%)")
+            elif vwap_distance_pct > 0.3:  # Price significantly above VWAP
+                bearish_points += 2
+                reasons.append(f"Overbought vs VWAP (+{vwap_distance_pct:.2f}%)")
+            elif vwap_distance_pct > 0.1:
+                bearish_points += 1
+                reasons.append(f"Above VWAP (+{vwap_distance_pct:.2f}%)")
+
+        # ========== DECISION ==========
+        # Need at least 5 points AND 3 point lead for strong signal
+        if bullish_points >= 5 and bullish_points >= bearish_points + 3:
+            signal = 'BULLISH'
+            strength = 'STRONG'
+        elif bearish_points >= 5 and bearish_points >= bullish_points + 3:
+            signal = 'BEARISH'
+            strength = 'STRONG'
+        elif bullish_points >= 4 and bullish_points > bearish_points:
+            signal = 'BULLISH'
+            strength = 'MODERATE'
+        elif bearish_points >= 4 and bearish_points > bullish_points:
+            signal = 'BEARISH'
+            strength = 'MODERATE'
+        else:
+            signal = 'NEUTRAL'
+            strength = 'WEAK'
+
+        return {
+            'signal': signal,
+            'strength': strength,
+            'bullish_points': bullish_points,
+            'bearish_points': bearish_points,
+            'reasons': reasons
+        }
+
+    @staticmethod
+    def calculate_master_trend_signal(bars_15min: list) -> dict:
+        """
+        Calculate the MASTER TREND signal from 15-minute bars.
+
+        This is M0 (METHOD 0) - the higher timeframe trend filter.
+        V8.1: More stable - uses only COMPLETED bars and longer EMA.
+
+        Key changes for stability:
+        - Skip the last bar (incomplete/updating)
+        - Use EMA50 instead of EMA20 for smoother trend
+        - Require stronger confirmation (higher thresholds)
+        - Focus on TREND DIRECTION not short-term moves
+
+        Parameters
+        ----------
+        bars_15min : list
+            List of 15-minute bar objects with: open, close, high, low, volume
+
+        Returns
+        -------
+        dict
+            {
+                'trend': 'UP' | 'DOWN' | 'NEUTRAL',
+                'strength': str,  # 'STRONG' | 'MODERATE' | 'WEAK'
+                'score': int,     # Total trend score
+                'ema20_slope': float,  # EMA slope percentage
+                'price_vs_ema': str,   # 'ABOVE' | 'BELOW'
+                'reasons': list
+            }
+        """
+        if not bars_15min or len(bars_15min) < 25:
+            return {
+                'trend': 'NEUTRAL',
+                'strength': 'WEAK',
+                'score': 0,
+                'ema20_slope': 0.0,
+                'price_vs_ema': 'N/A',
+                'reasons': ['Not enough 15-min bars (need 25+)']
+            }
+
+        # V8.1: Skip the LAST bar (incomplete) - use only completed bars
+        # This prevents flip-flopping from the updating current bar
+        completed_bars = bars_15min[:-1]
+        closes = [b.close for b in completed_bars]
+        highs = [b.high for b in completed_bars]
+        lows = [b.low for b in completed_bars]
+        current_price = closes[-1]  # Last COMPLETED bar's close
+
+        # Calculate EMAs for trend direction
+        def calc_ema(prices, period):
+            if len(prices) < period:
+                return sum(prices) / len(prices)
+            multiplier = 2 / (period + 1)
+            ema = sum(prices[:period]) / period
+            for price in prices[period:]:
+                ema = (price - ema) * multiplier + ema
+            return ema
+
+        # V8.1: Use EMA20 and compare to 8 bars ago for slope (2 hours of 15-min bars)
+        ema20_current = calc_ema(closes, 20)
+        ema20_8_bars_ago = calc_ema(closes[:-8], 20) if len(closes) > 28 else ema20_current
+
+        # EMA slope over 8 bars (~2 hours) - more stable
+        ema_slope = ((ema20_current - ema20_8_bars_ago) / ema20_8_bars_ago) * 100 if ema20_8_bars_ago > 0 else 0
+
+        bullish_score = 0
+        bearish_score = 0
+        reasons = []
+
+        # ========== 1. EMA SLOPE (up to 5 points) - MOST IMPORTANT ==========
+        # V8.1: Higher thresholds for stability
+        if ema_slope > 0.25:
+            bullish_score += 5
+            reasons.append(f"EMA20 rising strongly (+{ema_slope:.2f}%)")
+        elif ema_slope > 0.10:
+            bullish_score += 3
+            reasons.append(f"EMA20 rising (+{ema_slope:.2f}%)")
+        elif ema_slope > 0.03:
+            bullish_score += 1
+            reasons.append(f"EMA20 slightly up (+{ema_slope:.2f}%)")
+        elif ema_slope < -0.25:
+            bearish_score += 5
+            reasons.append(f"EMA20 falling strongly ({ema_slope:.2f}%)")
+        elif ema_slope < -0.10:
+            bearish_score += 3
+            reasons.append(f"EMA20 falling ({ema_slope:.2f}%)")
+        elif ema_slope < -0.03:
+            bearish_score += 1
+            reasons.append(f"EMA20 slightly down ({ema_slope:.2f}%)")
+
+        # ========== 2. PRICE vs EMA20 (up to 3 points) ==========
+        price_vs_ema = 'ABOVE' if current_price > ema20_current else 'BELOW'
+        price_distance = ((current_price - ema20_current) / ema20_current) * 100
+
+        if current_price > ema20_current:
+            if price_distance > 0.5:
+                bullish_score += 3
+                reasons.append(f"Price above EMA20 (+{price_distance:.2f}%)")
+            else:
+                bullish_score += 2
+                reasons.append(f"Price near EMA20 (+{price_distance:.2f}%)")
+        else:
+            if price_distance < -0.5:
+                bearish_score += 3
+                reasons.append(f"Price below EMA20 ({price_distance:.2f}%)")
+            else:
+                bearish_score += 2
+                reasons.append(f"Price near EMA20 ({price_distance:.2f}%)")
+
+        # ========== 3. COMPLETED CANDLE PATTERN (last 6 completed bars = 1.5 hours) ==========
+        # V8.1: Look at more bars for stability
+        last_6 = completed_bars[-6:]
+        green_candles = sum(1 for b in last_6 if b.close > b.open)
+        red_candles = 6 - green_candles
+
+        if green_candles >= 5:
+            bullish_score += 3
+            reasons.append(f"{green_candles}/6 green bars (strong)")
+        elif green_candles >= 4:
+            bullish_score += 2
+            reasons.append(f"{green_candles}/6 green bars")
+        elif red_candles >= 5:
+            bearish_score += 3
+            reasons.append(f"{red_candles}/6 red bars (strong)")
+        elif red_candles >= 4:
+            bearish_score += 2
+            reasons.append(f"{red_candles}/6 red bars")
+
+        # ========== 4. HIGHER HIGHS / LOWER LOWS (last 6 bars) ==========
+        # V8.1: Look at 6 bars for more reliable pattern
+        higher_highs = sum(1 for i in range(1, 6) if highs[-i] > highs[-i-1])
+        lower_lows = sum(1 for i in range(1, 6) if lows[-i] < lows[-i-1])
+        higher_lows = sum(1 for i in range(1, 6) if lows[-i] > lows[-i-1])
+        lower_highs = sum(1 for i in range(1, 6) if highs[-i] < highs[-i-1])
+
+        if higher_highs >= 4 and higher_lows >= 3:
+            bullish_score += 3
+            reasons.append(f"Strong uptrend (HH:{higher_highs} HL:{higher_lows})")
+        elif higher_highs >= 3:
+            bullish_score += 1
+            reasons.append(f"Higher highs ({higher_highs}/5)")
+
+        if lower_lows >= 4 and lower_highs >= 3:
+            bearish_score += 3
+            reasons.append(f"Strong downtrend (LL:{lower_lows} LH:{lower_highs})")
+        elif lower_lows >= 3:
+            bearish_score += 1
+            reasons.append(f"Lower lows ({lower_lows}/5)")
+
+        # ========== 5. 2-HOUR MOMENTUM (8 bars = 2 hours) ==========
+        # V8.1: Look at longer momentum for stability
+        momentum_8 = ((closes[-1] - closes[-8]) / closes[-8]) * 100 if len(closes) >= 8 else 0
+
+        if momentum_8 > 0.5:
+            bullish_score += 2
+            reasons.append(f"Strong 2hr momentum (+{momentum_8:.2f}%)")
+        elif momentum_8 > 0.2:
+            bullish_score += 1
+            reasons.append(f"Positive 2hr momentum (+{momentum_8:.2f}%)")
+        elif momentum_8 < -0.5:
+            bearish_score += 2
+            reasons.append(f"Strong bearish 2hr momentum ({momentum_8:.2f}%)")
+        elif momentum_8 < -0.2:
+            bearish_score += 1
+            reasons.append(f"Negative 2hr momentum ({momentum_8:.2f}%)")
+
+        # ========== 6. V9: RSI-14 TREND ZONE (up to 3 points) ==========
+        # RSI > 50 = bullish zone, RSI < 50 = bearish zone
+        # This confirms trend direction from a momentum perspective
+        def calc_rsi(prices, period=14):
+            if len(prices) < period + 1:
+                return 50.0  # Neutral if not enough data
+            gains = []
+            losses = []
+            for i in range(1, len(prices)):
+                change = prices[i] - prices[i-1]
+                gains.append(max(0, change))
+                losses.append(abs(min(0, change)))
+
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+
+            if avg_loss == 0:
+                return 100.0 if avg_gain > 0 else 50.0
+            rs = avg_gain / avg_loss
+            return 100 - (100 / (1 + rs))
+
+        rsi_15min = calc_rsi(closes, 14)
+
+        if rsi_15min > 60:
+            bullish_score += 3
+            reasons.append(f"RSI-14 bullish zone ({rsi_15min:.1f})")
+        elif rsi_15min > 50:
+            bullish_score += 1
+            reasons.append(f"RSI-14 above neutral ({rsi_15min:.1f})")
+        elif rsi_15min < 40:
+            bearish_score += 3
+            reasons.append(f"RSI-14 bearish zone ({rsi_15min:.1f})")
+        elif rsi_15min < 50:
+            bearish_score += 1
+            reasons.append(f"RSI-14 below neutral ({rsi_15min:.1f})")
+
+        # ========== 7. V9: ADX-14 TREND STRENGTH (up to 2 points) ==========
+        # ADX > 25 = strong trend (confirms direction)
+        # ADX < 20 = weak trend (NEUTRAL more likely)
+        def calc_adx(highs_list, lows_list, closes_list, period=14):
+            if len(highs_list) < period + 1:
+                return 20.0  # Default neutral
+
+            # Calculate True Range and Directional Movement
+            plus_dm = []
+            minus_dm = []
+            tr = []
+
+            for i in range(1, len(highs_list)):
+                high_diff = highs_list[i] - highs_list[i-1]
+                low_diff = lows_list[i-1] - lows_list[i]
+
+                plus_dm.append(high_diff if high_diff > low_diff and high_diff > 0 else 0)
+                minus_dm.append(low_diff if low_diff > high_diff and low_diff > 0 else 0)
+
+                tr1 = highs_list[i] - lows_list[i]
+                tr2 = abs(highs_list[i] - closes_list[i-1])
+                tr3 = abs(lows_list[i] - closes_list[i-1])
+                tr.append(max(tr1, tr2, tr3))
+
+            # Smoothed averages (last 'period' values)
+            atr = sum(tr[-period:]) / period if len(tr) >= period else sum(tr) / len(tr)
+            plus_di = (sum(plus_dm[-period:]) / period / atr * 100) if atr > 0 else 0
+            minus_di = (sum(minus_dm[-period:]) / period / atr * 100) if atr > 0 else 0
+
+            # DX and ADX
+            di_sum = plus_di + minus_di
+            dx = abs(plus_di - minus_di) / di_sum * 100 if di_sum > 0 else 0
+            return dx  # Simplified ADX (single period DX)
+
+        adx_15min = calc_adx(highs, lows, closes, 14)
+
+        if adx_15min > 30:
+            # Strong trend - boost the dominant direction
+            if bullish_score > bearish_score:
+                bullish_score += 2
+                reasons.append(f"ADX strong trend ({adx_15min:.1f}) confirms UP")
+            elif bearish_score > bullish_score:
+                bearish_score += 2
+                reasons.append(f"ADX strong trend ({adx_15min:.1f}) confirms DOWN")
+        elif adx_15min > 20:
+            if bullish_score > bearish_score:
+                bullish_score += 1
+                reasons.append(f"ADX moderate trend ({adx_15min:.1f})")
+            elif bearish_score > bullish_score:
+                bearish_score += 1
+                reasons.append(f"ADX moderate trend ({adx_15min:.1f})")
+        else:
+            reasons.append(f"ADX weak/no trend ({adx_15min:.1f})")
+
+        # ========== DECISION ==========
+        # V8.1: Higher thresholds for more stable trend detection
+        total_score = bullish_score - bearish_score
+
+        if bullish_score >= 9 and bullish_score >= bearish_score + 5:
+            trend = 'UP'
+            strength = 'STRONG'
+        elif bullish_score >= 6 and bullish_score >= bearish_score + 3:
+            trend = 'UP'
+            strength = 'MODERATE'
+        elif bearish_score >= 9 and bearish_score >= bullish_score + 5:
+            trend = 'DOWN'
+            strength = 'STRONG'
+        elif bearish_score >= 6 and bearish_score >= bullish_score + 3:
+            trend = 'DOWN'
+            strength = 'MODERATE'
+        else:
+            trend = 'NEUTRAL'
+            strength = 'WEAK'
+
+        return {
+            'trend': trend,
+            'strength': strength,
+            'score': total_score,
+            'bullish_score': bullish_score,
+            'bearish_score': bearish_score,
+            'ema20_slope': ema_slope,
+            'price_vs_ema': price_vs_ema,
+            'reasons': reasons
+        }
+
+    @staticmethod
+    def calculate_macro_context(bars_1h: list) -> dict:
+        """
+        V10.1: Calculate 1H MACRO CONTEXT using pandas-ta professional indicators.
+
+        Uses pandas-ta for:
+        - EMA 50/200 trend direction
+        - Supertrend (GOLD for crypto)
+        - ADX regime detection
+        - RSI momentum
+        - VWAP position (if volume available)
+
+        The macro context provides BOOST for good setups, never blocks.
+
+        Parameters
+        ----------
+        bars_1h : list
+            List of 1-hour bar objects with: open, close, high, low, volume
+
+        Returns
+        -------
+        dict with bias, regime, score_adjustment, etc.
+        """
+        import pandas as pd
+
+        # Default neutral result if not enough data
+        default_result = {
+            'bias': 'NEUTRAL',
+            'regime': 'UNKNOWN',
+            'trend_strength': 0.0,
+            'ema50': 0.0,
+            'ema200': 0.0,
+            'price_vs_ema50': 'N/A',
+            'price_vs_ema200': 'N/A',
+            'adx': 0.0,
+            'supertrend': 'N/A',
+            'rsi': 50.0,
+            'support': 0.0,
+            'resistance': 0.0,
+            'score_adjustment': 0,
+            'reasons': ['Insufficient 1H data']
+        }
+
+        if not bars_1h or len(bars_1h) < 20:
+            return default_result
+
+        try:
+            # Import pandas-ta
+            import pandas_ta as ta
+
+            # Convert bars to DataFrame
+            df = pd.DataFrame({
+                'open': [b.open for b in bars_1h],
+                'high': [b.high for b in bars_1h],
+                'low': [b.low for b in bars_1h],
+                'close': [b.close for b in bars_1h],
+                'volume': [getattr(b, 'volume', 0) for b in bars_1h]
+            })
+
+            current_price = df['close'].iloc[-1]
+            reasons = []
+            score_adjustment = 0
+
+            # ========== 1. EMA TREND (pandas-ta) ==========
+            # Use shorter EMAs if limited bars available (24 bars = 24 hours)
+            ema_short_len = min(20, len(df) - 5)  # Short EMA
+            ema_long_len = min(50, len(df) - 1)   # Long EMA
+            df['ema50'] = ta.ema(df['close'], length=ema_short_len)
+            df['ema200'] = ta.ema(df['close'], length=ema_long_len)
+
+            ema50 = df['ema50'].iloc[-1]
+            ema200 = df['ema200'].iloc[-1]
+
+            price_vs_ema50 = 'ABOVE' if current_price > ema50 else 'BELOW'
+            price_vs_ema200 = 'ABOVE' if current_price > ema200 else 'BELOW'
+
+            # ========== 2. SUPERTREND (pandas-ta) - GAME CHANGER ==========
+            supertrend_df = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3.0)
+            if supertrend_df is not None and not supertrend_df.empty:
+                # Supertrend direction column is 'SUPERTd_10_3.0': 1 = bullish, -1 = bearish
+                direction_col = [c for c in supertrend_df.columns if 'SUPERTd' in c]
+                if direction_col:
+                    st_direction = supertrend_df[direction_col[0]].iloc[-1]
+                    if pd.notna(st_direction):
+                        supertrend_signal = 'BULL' if st_direction == 1 else 'BEAR'
+                    else:
+                        supertrend_signal = 'N/A'
+                else:
+                    supertrend_signal = 'N/A'
+            else:
+                supertrend_signal = 'N/A'
+
+            # ========== 3. ADX (pandas-ta) ==========
+            adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+            if adx_df is not None and not adx_df.empty:
+                adx = adx_df['ADX_14'].iloc[-1]
+                plus_di = adx_df['DMP_14'].iloc[-1]
+                minus_di = adx_df['DMN_14'].iloc[-1]
+            else:
+                adx = 20.0
+                plus_di = 0
+                minus_di = 0
+
+            # ========== 4. RSI (pandas-ta) ==========
+            rsi_series = ta.rsi(df['close'], length=14)
+            rsi = rsi_series.iloc[-1] if rsi_series is not None else 50.0
+
+            # ========== BIAS CALCULATION ==========
+            # V10.1: Multi-signal consensus for bias
+
+            bull_signals = 0
+            bear_signals = 0
+
+            # Signal 1: Price vs EMA50
+            if current_price > ema50:
+                bull_signals += 1
+                reasons.append(f"Price > EMA50")
+            else:
+                bear_signals += 1
+                reasons.append(f"Price < EMA50")
+
+            # Signal 2: EMA50 vs EMA200 (Golden/Death Cross)
+            if ema50 > ema200:
+                bull_signals += 1
+                reasons.append(f"EMA50 > EMA200 (Golden)")
+            else:
+                bear_signals += 1
+                reasons.append(f"EMA50 < EMA200 (Death)")
+
+            # Signal 3: Supertrend (HEAVY WEIGHT - 2 points)
+            if supertrend_signal == 'BULL':
+                bull_signals += 2
+                reasons.append(f"Supertrend BULLISH")
+            elif supertrend_signal == 'BEAR':
+                bear_signals += 2
+                reasons.append(f"Supertrend BEARISH")
+
+            # Signal 4: RSI momentum
+            if rsi > 55:
+                bull_signals += 1
+                reasons.append(f"RSI bullish ({rsi:.1f})")
+            elif rsi < 45:
+                bear_signals += 1
+                reasons.append(f"RSI bearish ({rsi:.1f})")
+
+            # Signal 5: DI+ vs DI- (trend direction)
+            if plus_di > minus_di:
+                bull_signals += 1
+                reasons.append(f"DI+ > DI- ({plus_di:.1f} vs {minus_di:.1f})")
+            elif minus_di > plus_di:
+                bear_signals += 1
+                reasons.append(f"DI- > DI+ ({minus_di:.1f} vs {plus_di:.1f})")
+
+            # ========== DETERMINE BIAS ==========
+            # V10.1: Consensus-based bias (out of 6 possible signals)
+            if bull_signals >= 4:
+                bias = 'BULLISH'
+                score_adjustment = 2
+            elif bull_signals >= 3:
+                bias = 'BULLISH'
+                score_adjustment = 1
+            elif bear_signals >= 4:
+                bias = 'BEARISH'
+                score_adjustment = 0  # Don't penalize, just neutral
+            elif bear_signals >= 3:
+                bias = 'BEARISH'
+                score_adjustment = 0
+            else:
+                bias = 'NEUTRAL'
+                score_adjustment = 0
+
+            reasons.append(f"Consensus: {bull_signals} BULL vs {bear_signals} BEAR")
+
+            # ========== REGIME DETECTION ==========
+            if adx > 25:
+                regime = 'TRENDING'
+                if bias == 'BULLISH':
+                    score_adjustment = min(2, score_adjustment + 1)
+                reasons.append(f"ADX={adx:.1f}: TRENDING")
+            elif adx < 20:
+                regime = 'RANGING'
+                reasons.append(f"ADX={adx:.1f}: RANGING")
+            else:
+                regime = 'TRANSITIONING'
+                reasons.append(f"ADX={adx:.1f}: TRANSITIONING")
+
+            # ========== SUPPORT/RESISTANCE ==========
+            lookback = min(24, len(df))
+            resistance = df['high'].iloc[-lookback:].max()
+            support = df['low'].iloc[-lookback:].min()
+
+            price_range = resistance - support
+            if price_range > 0:
+                dist_to_support = (current_price - support) / price_range
+                if dist_to_support < 0.15:
+                    reasons.append(f"Near support ${support:.2f}")
+                    if bias == 'BULLISH':
+                        score_adjustment = min(2, score_adjustment + 1)
+
+            # ========== TREND STRENGTH ==========
+            trend_strength = min(100, max(0, adx + abs(bull_signals - bear_signals) * 10))
+
+            # Clamp score adjustment
+            score_adjustment = max(-2, min(2, score_adjustment))
+
+            return {
+                'bias': bias,
+                'regime': regime,
+                'trend_strength': trend_strength,
+                'ema50': ema50,
+                'ema200': ema200,
+                'price_vs_ema50': price_vs_ema50,
+                'price_vs_ema200': price_vs_ema200,
+                'adx': adx,
+                'supertrend': supertrend_signal,
+                'rsi': rsi,
+                'support': support,
+                'resistance': resistance,
+                'score_adjustment': score_adjustment,
+                'reasons': reasons
+            }
+
+        except Exception as e:
+            # Fallback to simple calculation if pandas-ta fails
+            return {
+                'bias': 'NEUTRAL',
+                'regime': 'UNKNOWN',
+                'trend_strength': 0.0,
+                'ema50': 0.0,
+                'ema200': 0.0,
+                'price_vs_ema50': 'N/A',
+                'price_vs_ema200': 'N/A',
+                'adx': 0.0,
+                'supertrend': 'N/A',
+                'rsi': 50.0,
+                'support': 0.0,
+                'resistance': 0.0,
+                'score_adjustment': 0,
+                'reasons': [f'Error: {str(e)}']
+            }

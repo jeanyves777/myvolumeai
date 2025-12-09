@@ -9,6 +9,7 @@ Provides robust caching for:
 Both training and backtesting use the same cached data.
 Only downloads missing data.
 """
+print(">>> [data_cache.py] Module loading...", flush=True)
 
 import os
 import json
@@ -17,8 +18,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
+print(">>> [data_cache.py] pandas imported, loading joblib...", flush=True)
 import joblib
 import hashlib
+print(">>> [data_cache.py] Module loaded OK", flush=True)
 
 logger = logging.getLogger(__name__)
 

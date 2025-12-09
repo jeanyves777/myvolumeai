@@ -6,6 +6,8 @@ Handles configuration for crypto spot trading including:
 - Position sizing
 - Risk controls
 - Symbol selection
+
+Supports both paper trading and LIVE trading modes.
 """
 
 import json
@@ -15,14 +17,14 @@ from typing import Optional, List
 from pathlib import Path
 
 
-# Configuration file path
+# Configuration file paths
 CONFIG_DIR = Path.home() / ".thevolumeai"
 CRYPTO_CONFIG_FILE = CONFIG_DIR / "crypto_trading_config.json"
+CRYPTO_LIVE_CONFIG_FILE = CONFIG_DIR / "crypto_live_trading_config.json"
 
-# Supported crypto symbols on Alpaca
+# Supported crypto symbols on Alpaca (V6: 5 best performers)
 ALPACA_CRYPTO_SYMBOLS = [
-    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "LINK/USD",
-    "AVAX/USD", "DOT/USD", "LTC/USD", "UNI/USD", "SHIB/USD"
+    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD"
 ]
 
 
@@ -44,10 +46,10 @@ class CryptoTradingConfig:
     # Selected symbols to trade
     symbols: List[str] = field(default_factory=lambda: ALPACA_CRYPTO_SYMBOLS.copy())
 
-    # Risk parameters
-    target_profit_pct: float = 1.0        # Take profit %
-    stop_loss_pct: float = 0.5            # Stop loss %
-    trailing_stop_pct: float = 0.3        # Trailing stop %
+    # Risk parameters - V6: Optimized for crypto volatility
+    target_profit_pct: float = 1.5        # V6: Take profit % (net ~1.0% after fees)
+    stop_loss_pct: float = 1.0            # V6: Stop loss % (wider for crypto volatility)
+    trailing_stop_pct: float = 0.5        # V6: Trailing stop %
     use_trailing_stop: bool = True
 
     # Risk controls
@@ -56,9 +58,9 @@ class CryptoTradingConfig:
     max_concurrent_positions: int = 3     # Max concurrent positions
     min_time_between_trades: int = 60     # Seconds between trades per symbol
 
-    # Indicator parameters
+    # Indicator parameters - V6: Widened RSI for trend filter
     rsi_period: int = 14
-    rsi_oversold: float = 30.0
+    rsi_oversold: float = 35.0            # V6: Widened from 30 to 35
     rsi_overbought: float = 70.0
     bb_period: int = 20
     bb_std_dev: float = 2.0
@@ -239,6 +241,93 @@ def run_crypto_setup_wizard() -> CryptoTradingConfig:
         print("\nConfiguration not saved.")
 
     return config
+
+
+@dataclass
+class CryptoLiveTradingConfig:
+    """
+    Configuration for LIVE crypto trading.
+
+    WARNING: This configuration is for REAL MONEY trading.
+    All trades will be executed with real funds.
+    """
+
+    # Alpaca API credentials (LIVE account)
+    api_key: str = ""
+    api_secret: str = ""
+
+    # ALWAYS False for live trading (do not change)
+    use_paper: bool = False
+
+    # Trading parameters - CONSERVATIVE defaults for live trading
+    fixed_position_value: float = 0.0   # User MUST set this explicitly
+    max_position_value: float = 500.0   # Conservative max per symbol
+
+    # Selected symbols to trade
+    symbols: List[str] = field(default_factory=lambda: ALPACA_CRYPTO_SYMBOLS.copy())
+
+    # Risk parameters - V6: Optimized for crypto volatility
+    target_profit_pct: float = 1.5        # V6: Take profit % (net ~1.0% after fees)
+    stop_loss_pct: float = 1.0            # V6: Stop loss % (wider for crypto volatility)
+    trailing_stop_pct: float = 0.5        # V6: Trailing stop %
+    use_trailing_stop: bool = True
+
+    # Strict risk controls for live trading
+    max_daily_loss: float = 100.0         # Daily loss limit (conservative)
+    max_trades_per_day: int = 20          # Max trades per day (conservative)
+    max_concurrent_positions: int = 3     # Max concurrent positions
+    min_time_between_trades: int = 120    # Longer cooldown for live
+
+    # Trading hours (UTC) - Peak hours only for live trading
+    use_time_filter: bool = True
+    allowed_trading_hours: List[int] = field(
+        default_factory=lambda: list(range(13, 21))  # US trading hours only
+    )
+
+    # Hold time limits
+    max_hold_minutes: int = 60
+    min_hold_minutes: int = 5
+
+    # Entry requirements - stricter for live
+    min_entry_score: int = 7  # Higher threshold for live
+
+    # Alpaca crypto fee (0.25% taker)
+    taker_fee_pct: float = 0.25
+
+    def is_configured(self) -> bool:
+        """Check if API credentials and position size are configured."""
+        return bool(self.api_key and self.api_secret and self.fixed_position_value > 0)
+
+    def save(self) -> None:
+        """Save configuration to file."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CRYPTO_LIVE_CONFIG_FILE, 'w') as f:
+            json.dump(asdict(self), f, indent=2)
+        print(f"\nLIVE configuration saved to: {CRYPTO_LIVE_CONFIG_FILE}")
+
+    @classmethod
+    def load(cls) -> 'CryptoLiveTradingConfig':
+        """Load configuration from file."""
+        if CRYPTO_LIVE_CONFIG_FILE.exists():
+            try:
+                with open(CRYPTO_LIVE_CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+                # Ensure use_paper is always False for live config
+                data['use_paper'] = False
+                return cls(**data)
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"Warning: Could not load live crypto config file: {e}")
+                return cls()
+        return cls()
+
+    @classmethod
+    def exists(cls) -> bool:
+        """Check if configuration file exists."""
+        return CRYPTO_LIVE_CONFIG_FILE.exists()
+
+    def get_active_symbols(self) -> List[str]:
+        """Get list of symbols to actively trade."""
+        return self.symbols if self.symbols else ALPACA_CRYPTO_SYMBOLS
 
 
 def run_crypto_reconfigure() -> CryptoTradingConfig:

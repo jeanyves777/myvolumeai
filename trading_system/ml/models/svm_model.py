@@ -5,10 +5,25 @@ Support Vector Machine Model for ensemble.
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
 
 from ..base import BaseMLModel, MLModelConfig
+
+# Lazy sklearn imports
+_sklearn_loaded = False
+SVC = None
+StandardScaler = None
+
+def _load_sklearn():
+    """Lazy load sklearn to avoid slow import at module load."""
+    global _sklearn_loaded, SVC, StandardScaler
+    if not _sklearn_loaded:
+        print(">>> [svm_model] Loading sklearn...", flush=True)
+        from sklearn.svm import SVC as _SVC
+        from sklearn.preprocessing import StandardScaler as SS
+        SVC = _SVC
+        StandardScaler = SS
+        _sklearn_loaded = True
+        print(">>> [svm_model] sklearn loaded OK", flush=True)
 
 
 class SVMModel(BaseMLModel):
@@ -46,10 +61,13 @@ class SVMModel(BaseMLModel):
               X_val: Optional[pd.DataFrame] = None,
               y_val: Optional[pd.Series] = None) -> Dict[str, float]:
         """Train the SVM model."""
-        
+
+        # Lazy load sklearn
+        _load_sklearn()
+
         # Store feature columns
         self.feature_columns = X_train.columns.tolist()
-        
+
         # SVM requires scaling
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)

@@ -9,14 +9,28 @@ Ensures high-quality training data by:
 
 NO NaN or invalid zeros allowed - all gaps filled with pattern-based synthetic data.
 """
+print(">>> [data_quality.py] Module loading...", flush=True)
 
 import pandas as pd
 import numpy as np
 from typing import Optional, Dict, List, Tuple
 import logging
-from scipy import stats
-from scipy.interpolate import interp1d
 
+# LAZY scipy imports - these are slow to load
+_scipy_loaded = False
+
+def _ensure_scipy():
+    """Lazy load scipy only when needed."""
+    global _scipy_loaded
+    if not _scipy_loaded:
+        print(">>> [data_quality.py] Loading scipy (this may take a moment)...", flush=True)
+        global stats, interp1d
+        from scipy import stats
+        from scipy.interpolate import interp1d
+        _scipy_loaded = True
+        print(">>> [data_quality.py] scipy loaded OK", flush=True)
+
+print(">>> [data_quality.py] Module loaded (scipy deferred)", flush=True)
 logger = logging.getLogger(__name__)
 
 

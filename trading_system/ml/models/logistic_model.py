@@ -5,10 +5,25 @@ Logistic Regression Model for ensemble.
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 
 from ..base import BaseMLModel, MLModelConfig
+
+# Lazy sklearn imports
+_sklearn_loaded = False
+LogisticRegression = None
+StandardScaler = None
+
+def _load_sklearn():
+    """Lazy load sklearn to avoid slow import at module load."""
+    global _sklearn_loaded, LogisticRegression, StandardScaler
+    if not _sklearn_loaded:
+        print(">>> [logistic_model] Loading sklearn...", flush=True)
+        from sklearn.linear_model import LogisticRegression as LR
+        from sklearn.preprocessing import StandardScaler as SS
+        LogisticRegression = LR
+        StandardScaler = SS
+        _sklearn_loaded = True
+        print(">>> [logistic_model] sklearn loaded OK", flush=True)
 
 
 class LogisticModel(BaseMLModel):
@@ -46,10 +61,13 @@ class LogisticModel(BaseMLModel):
               X_val: Optional[pd.DataFrame] = None,
               y_val: Optional[pd.Series] = None) -> Dict[str, float]:
         """Train the Logistic Regression model."""
-        
+
+        # Lazy load sklearn
+        _load_sklearn()
+
         # Store feature columns
         self.feature_columns = X_train.columns.tolist()
-        
+
         # Logistic Regression requires scaling
         self.scaler = StandardScaler()
         X_train_scaled = self.scaler.fit_transform(X_train)

@@ -40,9 +40,11 @@ class PaperTradingConfig:
     underlying_symbol: str = "COIN"
 
     # Trading times (EST)
+    # NOTE: Extended entry window to 15:45 for TESTING purposes only
+    # PRODUCTION should be: entry_time_start="09:30:00", entry_time_end="10:00:00"
     entry_time_start: str = "09:30:00"
-    entry_time_end: str = "10:00:00"
-    force_exit_time: str = "15:55:00"
+    entry_time_end: str = "15:45:00"  # TESTING: Extended from 10:00 to 15:45
+    force_exit_time: str = "15:50:00"  # Force exit at 3:50 PM EST
 
     # Risk parameters
     target_profit_pct: float = 7.5
